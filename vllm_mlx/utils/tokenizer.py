@@ -90,10 +90,6 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
     _try_inject_mtp(model, model_path, config)
     return model, tokenizer
 
-    # After successful load, check if MTP weights exist but were stripped by sanitize()
-    _try_inject_mtp_post_load(model, model_name)
-    return model, tokenizer
-
 
 def _try_inject_mtp(model, model_path, config):
     """Inject MTP support if model has MTP config + weights."""
