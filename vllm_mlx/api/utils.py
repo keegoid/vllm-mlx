@@ -153,7 +153,7 @@ class StreamingToolCallFilter:
             if idx >= 0:
                 # Found an open tag - emit text before it, enter block mode
                 emit = self._buffer[:idx]
-                self._buffer = self._buffer[idx + len(open_tag):]
+                self._buffer = self._buffer[idx + len(open_tag) :]
                 self._in_block = True
                 self._close_tag = close_tag
                 # Process remainder in case close tag is already in buffer
@@ -185,7 +185,7 @@ class StreamingToolCallFilter:
         idx = self._buffer.find(self._close_tag)
         if idx >= 0:
             # Block closed - discard content up to and including close tag
-            self._buffer = self._buffer[idx + len(self._close_tag):]
+            self._buffer = self._buffer[idx + len(self._close_tag) :]
             self._in_block = False
             self._close_tag = ""
             # Process remainder - might have more text or another tool call
@@ -249,7 +249,7 @@ class StreamingThinkRouter:
                 if idx >= 0:
                     # Emit thinking content, exit think mode
                     thinking = self._buffer[:idx]
-                    self._buffer = self._buffer[idx + len("</think>"):]
+                    self._buffer = self._buffer[idx + len("</think>") :]
                     self._in_think = False
                     if thinking:
                         pieces.append(("thinking", thinking))
@@ -274,7 +274,7 @@ class StreamingThinkRouter:
                 if idx >= 0:
                     # Emit text before tag, enter think mode
                     before = self._buffer[:idx]
-                    self._buffer = self._buffer[idx + len("<think>"):]
+                    self._buffer = self._buffer[idx + len("<think>") :]
                     self._in_think = True
                     if before:
                         pieces.append(("text", before))

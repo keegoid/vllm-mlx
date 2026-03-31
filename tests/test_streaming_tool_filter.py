@@ -27,9 +27,7 @@ class TestStreamingToolCallFilter(unittest.TestCase):
 
     def test_text_before_and_after_same_delta(self):
         f = StreamingToolCallFilter()
-        result = f.process(
-            "Before <minimax:tool_call>inside</minimax:tool_call>After"
-        )
+        result = f.process("Before <minimax:tool_call>inside</minimax:tool_call>After")
         assert result == "Before After"
 
     def test_split_across_deltas(self):
@@ -66,9 +64,7 @@ class TestStreamingToolCallFilter(unittest.TestCase):
         """Simulates a Read tool returning a large file."""
         f = StreamingToolCallFilter()
         big = "x" * 10000
-        result = f.process(
-            f"Before <minimax:tool_call>{big}</minimax:tool_call>After"
-        )
+        result = f.process(f"Before <minimax:tool_call>{big}</minimax:tool_call>After")
         assert result == "Before After"
 
     def test_think_tags_not_filtered(self):

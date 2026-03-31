@@ -16,9 +16,7 @@ class TestEmitContentPieces(unittest.TestCase):
     """Test the refactored _emit_content_pieces helper."""
 
     def test_single_text_block(self):
-        events, block_type, index = _emit_content_pieces(
-            [("text", "hello")], None, 0
-        )
+        events, block_type, index = _emit_content_pieces([("text", "hello")], None, 0)
         assert len(events) == 2  # block_start + delta
         assert block_type == "text"
         assert index == 0
@@ -51,9 +49,7 @@ class TestEmitContentPieces(unittest.TestCase):
 
     def test_continues_existing_block(self):
         """If current_block_type matches, no start/stop emitted."""
-        events, block_type, index = _emit_content_pieces(
-            [("text", "more")], "text", 0
-        )
+        events, block_type, index = _emit_content_pieces([("text", "more")], "text", 0)
         assert len(events) == 1  # just delta, no start
         assert block_type == "text"
 
@@ -161,19 +157,22 @@ class TestStreamingPipelineIntegration(unittest.TestCase):
 
     def test_text_then_tool_call(self):
         """Text followed by tool call - tool markup suppressed from text."""
-        events, accumulated, _ = self._run_pipeline([
-            "I'll search for that. ",
-            "<minimax:tool_call>",
-            '<invoke name="bash">',
-            '<parameter name="command">ls /tmp</parameter>',
-            "</invoke>",
-            "</minimax:tool_call>",
-        ])
+        events, accumulated, _ = self._run_pipeline(
+            [
+                "I'll search for that. ",
+                "<minimax:tool_call>",
+                '<invoke name="bash">',
+                '<parameter name="command">ls /tmp</parameter>',
+                "</invoke>",
+                "</minimax:tool_call>",
+            ]
+        )
         parsed = self._parse_events(events)
 
         # Only text block should appear (tool call is suppressed from streaming)
         text_deltas = [
-            p for p in parsed
+            p
+            for p in parsed
             if p["type"] == "content_block_delta"
             and p["delta"].get("type") == "text_delta"
         ]
