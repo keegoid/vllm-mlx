@@ -52,8 +52,9 @@ class MLLMSchedulerConfig:
     prefill_batch_size: int = 16
     # Completion batch size
     completion_batch_size: int = 16
-    # Prefill step size for chunked prefill
-    prefill_step_size: int = 1024
+    # Prefill step size for chunked prefill (raised from 1024 to support
+    # large agent prompts, e.g. OpenClaw sends ~15K tokens with tool defs)
+    prefill_step_size: int = 16384
     # Enable vision embedding cache
     enable_vision_cache: bool = True
     # Maximum cache entries
