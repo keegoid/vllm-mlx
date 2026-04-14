@@ -1163,13 +1163,13 @@ class MLLMBatchGenerator:
                     )
 
                 elif cached_kv is not None and not remaining_ids:
-                    # Exact/supersequence match — cache has all tokens,
-                    # but we still need logits for the last token.
-                    # fetch() with trim-by-1 store always returns remaining=[last_token].
-                    # If we get here (empty remaining), re-run on last token.
-                    # Copy cache to prevent mutation of stored prefix cache entry.
-                    request_cache = self._copy_prefix_cache(cached_kv)
-                    self._trim_rotating_caches(request_cache)
+                    # Exact/supersequence match — cache has all prompt tokens,
+                    # but we still need logits for the last position.
+                    # Trim by 1 so re-running the last token produces correct
+                    # logits for the next-token prediction.
+                    # _trim_cache_offset creates new cache objects (safe for
+                    # stored entry).
+                    request_cache = _trim_cache_offset(cached_kv, 1)
                     last_token = req.input_ids[:, -1:]
                     total_tokens = len(input_ids_list)
                     self._prefill_progress[req.request_id] = (
@@ -1650,13 +1650,13 @@ class MLLMBatchGenerator:
                 try:
                     extracted = batch.extract_cache(i)
                     input_ids_list = req.input_ids.reshape(-1).tolist()
-                    # Store prompt-only KV (trim output tokens + 1 so next
-                    # fetch returns remaining=[last_prompt_token] at minimum).
-                    # Also strip think suffix from key so next request's
-                    # (also stripped) key matches as a clean PREFIX.
+                    # Store prompt-only KV: trim generated tokens (+ think
+                    # suffix) so the stored offset equals key length exactly.
+                    # The exact-match path trims by 1 at fetch time to
+                    # re-derive logits for the last prompt token.
                     output_count = batch.num_tokens[i]
                     S = self._think_suffix_len
-                    total_trim = output_count + 1 + S
+                    total_trim = output_count + S
                     prompt_cache = _trim_cache_offset(extracted, total_trim)
                     cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
                     self.prefix_cache.store(cache_key, prompt_cache)
