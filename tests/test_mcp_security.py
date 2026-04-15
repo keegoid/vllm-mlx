@@ -6,7 +6,9 @@ These tests verify that the MCP command validation properly prevents
 command injection attacks and other security vulnerabilities.
 """
 
+import json
 import re
+
 import pytest
 from vllm_mlx.mcp import security as mcp_security
 from vllm_mlx.mcp.config import validate_config
@@ -358,6 +360,88 @@ class TestMCPServerConfigSecurity:
 
         assert "skip_security_validation" in str(exc_info.value)
         assert ALLOW_UNSAFE_ENV_VAR in str(exc_info.value)
+
+
+class TestMCPConfigDiscovery:
+    """Tests for MCP config discovery paths."""
+
+    def test_load_mcp_config_ignores_current_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """Ambient ./mcp.json files should not be auto-loaded."""
+        from vllm_mlx.mcp.config import load_mcp_config
+
+        cwd = tmp_path / "workspace"
+        cwd.mkdir()
+        (cwd / "mcp.json").write_text(json.dumps({"servers": {"cwd": {}}}))
+        monkeypatch.chdir(cwd)
+        monkeypatch.delenv("VLLM_MLX_MCP_CONFIG", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+        config = load_mcp_config()
+
+        assert config.servers == {}
+
+    def test_load_mcp_config_allows_explicit_path_in_cwd(self, tmp_path, monkeypatch):
+        """Explicit relative paths should still be honored."""
+        from vllm_mlx.mcp.config import load_mcp_config
+
+        cwd = tmp_path / "workspace"
+        cwd.mkdir()
+        config_path = cwd / "mcp.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "servers": {
+                        "filesystem": {
+                            "transport": "stdio",
+                            "command": "npx",
+                            "args": [
+                                "-y",
+                                "@modelcontextprotocol/server-filesystem",
+                                "/tmp",
+                            ],
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.chdir(cwd)
+
+        config = load_mcp_config("./mcp.json")
+
+        assert "filesystem" in config.servers
+
+    def test_load_mcp_config_uses_user_config_directory(self, tmp_path, monkeypatch):
+        """Per-user config discovery should still work."""
+        from vllm_mlx.mcp.config import load_mcp_config
+
+        home = tmp_path / "home"
+        config_dir = home / ".config" / "vllm-mlx"
+        config_dir.mkdir(parents=True)
+        (config_dir / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "servers": {
+                        "filesystem": {
+                            "transport": "stdio",
+                            "command": "npx",
+                            "args": [
+                                "-y",
+                                "@modelcontextprotocol/server-filesystem",
+                                "/tmp",
+                            ],
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("VLLM_MLX_MCP_CONFIG", raising=False)
+
+        config = load_mcp_config()
+
+        assert "filesystem" in config.servers
 
 
 class TestDefaultWhitelist:
