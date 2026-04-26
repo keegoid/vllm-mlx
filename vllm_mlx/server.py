@@ -616,7 +616,7 @@ def _prepare_anthropic_invocation(
     effective_max_tokens: int,
 ) -> PreparedChatInvocation:
     """Precompute messages, kwargs, and decoding constraints for Anthropic API."""
-    messages, _, _, _ = _prepare_chat_messages(engine, openai_request.messages)
+    messages, _, _, _, _ = _prepare_chat_messages(engine, openai_request.messages)
     response_format = openai_request.response_format
     messages, json_logits_processor = _prepare_json_logits_processor(
         engine,
