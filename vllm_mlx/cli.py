@@ -329,9 +329,13 @@ def model_command(args):
     from .model_workflow import (
         AcquisitionOptions,
         ConversionOptions,
+        QualificationOptions,
+        RegistrationOptions,
         acquire_model,
         convert_model,
         inspect_model,
+        qualify_model,
+        register_model,
     )
 
     if args.model_command == "inspect":
@@ -370,7 +374,43 @@ def model_command(args):
         if payload.get("status") == "failed":
             print(json.dumps(payload, indent=2))
             sys.exit(payload.get("returncode") or 1)
-            return  # unreachable, but prevents double-print if sys.exit is caught
+    elif args.model_command == "register":
+        payload = register_model(
+            RegistrationOptions(
+                artifact_path=args.artifact,
+                model_id=args.model_id,
+                served_model_name=args.served_model_name,
+                preset_alias=args.preset_alias,
+                output_path=args.output,
+                mllm=args.mllm,
+                tool_call_parser=args.tool_call_parser,
+                reasoning_parser=args.reasoning_parser,
+                default_temperature=args.default_temperature,
+                default_top_p=args.default_top_p,
+                default_top_k=args.default_top_k,
+                default_min_p=args.default_min_p,
+                default_presence_penalty=args.default_presence_penalty,
+                default_repetition_penalty=args.default_repetition_penalty,
+                chat_template_kwargs=args.default_chat_template_kwargs,
+                feature_flags=args.feature_flag,
+            )
+        )
+    elif args.model_command == "qualify":
+        payload = qualify_model(
+            QualificationOptions(
+                model_id=args.model_id,
+                server_url=args.url,
+                workload_path=args.workload,
+                output_path=args.output,
+                result_path=args.result_output,
+                repetitions=args.repetitions,
+                dry_run=args.dry_run,
+                extra_args=args.extra_arg,
+            )
+        )
+        if payload.get("status") == "failed":
+            print(json.dumps(payload, indent=2))
+            sys.exit(payload.get("returncode") or 1)
     else:
         raise ValueError(f"Unsupported model command: {args.model_command}")
 
@@ -1511,8 +1551,18 @@ Examples:
         action="store_true",
         help="Generate a quantized MLX model",
     )
-    model_convert_parser.add_argument("--q-bits", type=int, default=None)
-    model_convert_parser.add_argument("--q-group-size", type=int, default=None)
+    model_convert_parser.add_argument(
+        "--q-bits",
+        type=int,
+        default=None,
+        help="Quantization bit width (e.g. 3, 4, 8)",
+    )
+    model_convert_parser.add_argument(
+        "--q-group-size",
+        type=int,
+        default=None,
+        help="Quantization group size (default: mlx-lm default)",
+    )
     model_convert_parser.add_argument(
         "--q-mode",
         choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
@@ -1539,6 +1589,164 @@ Examples:
         "--dry-run",
         action="store_true",
         help="Print the conversion command and manifest without executing",
+    )
+
+    model_register_parser = model_subparsers.add_parser(
+        "register",
+        help="Write a portable registration manifest for a finalized artifact",
+    )
+    model_register_parser.add_argument(
+        "artifact",
+        type=str,
+        help="Finalized local model artifact directory",
+    )
+    model_register_parser.add_argument(
+        "--model-id",
+        type=str,
+        default=None,
+        help="Override model ID (default: directory name of artifact)",
+    )
+    model_register_parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="Model name exposed by the API (default: model-id)",
+    )
+    model_register_parser.add_argument(
+        "--preset-alias",
+        type=str,
+        default=None,
+        help="Optional alias for preset lookup in registry",
+    )
+    model_register_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Manifest path. Defaults to artifact/vllm_mlx_registration_manifest.json",
+    )
+    mllm_group = model_register_parser.add_mutually_exclusive_group()
+    mllm_group.add_argument(
+        "--mllm",
+        action="store_true",
+        default=None,
+        help="Mark the artifact as an MLLM serving candidate",
+    )
+    mllm_group.add_argument(
+        "--no-mllm",
+        action="store_false",
+        dest="mllm",
+        help="Explicitly mark the artifact as text-only",
+    )
+    model_register_parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        help="Tool call parser name for the model (e.g. qwen3_coder, mistral)",
+    )
+    model_register_parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        default=None,
+        help="Reasoning parser name for thinking models (e.g. qwen3)",
+    )
+    model_register_parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Default temperature for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Default top_p for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Default top_k for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Default min_p for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help="Default presence_penalty for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help="Default repetition_penalty for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=make_json_object_arg_parser("--default-chat-template-kwargs"),
+        default=None,
+        help='Default chat template kwargs as JSON, e.g. {"enable_thinking": true}',
+    )
+    model_register_parser.add_argument(
+        "--feature-flag",
+        action="append",
+        default=[],
+        help="Feature flag to record in the registration manifest. Repeatable.",
+    )
+
+    model_qualify_parser = model_subparsers.add_parser(
+        "qualify",
+        help="Create or run a bench-serve qualification handoff",
+    )
+    model_qualify_parser.add_argument(
+        "model_id",
+        type=str,
+        help="Model ID to qualify against the running server",
+    )
+    model_qualify_parser.add_argument(
+        "--url",
+        type=str,
+        default="http://127.0.0.1:8080",
+        help="Running server URL for bench-serve",
+    )
+    model_qualify_parser.add_argument(
+        "--workload",
+        type=str,
+        default=None,
+        help="bench-serve workload contract path",
+    )
+    model_qualify_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Qualification request manifest path",
+    )
+    model_qualify_parser.add_argument(
+        "--result-output",
+        type=str,
+        default=None,
+        help="Result output path passed to bench-serve",
+    )
+    model_qualify_parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=None,
+        help="Number of repetitions per benchmark sweep configuration",
+    )
+    model_qualify_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write or print the qualification command without running it",
+    )
+    model_qualify_parser.add_argument(
+        "--extra-arg",
+        action="append",
+        default=[],
+        help="Extra argument passed through to bench-serve. Repeatable.",
     )
 
     # Serving benchmark
