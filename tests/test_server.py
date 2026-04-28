@@ -1237,7 +1237,7 @@ class TestMaxTokensLimit:
         fake_engine = FakeEngine()
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return fake_engine
 
