@@ -33,6 +33,10 @@ def server_state():
     original_store = srv._responses_store
     original_store_max_size = srv._RESPONSES_STORE_MAX_SIZE
     original_api_key = srv._api_key
+    original_enable_auto_tool_choice = getattr(srv, "_enable_auto_tool_choice", False)
+    original_tool_call_parser = getattr(srv, "_tool_call_parser", None)
+    original_tool_parser_instance = getattr(srv, "_tool_parser_instance", None)
+    original_reasoning_parser = getattr(srv, "_reasoning_parser", None)
     original_default_chat_template_kwargs = getattr(
         srv, "_default_chat_template_kwargs", None
     )
@@ -42,6 +46,10 @@ def server_state():
     srv._responses_store = OrderedDict()
     srv._RESPONSES_STORE_MAX_SIZE = 1000
     srv._api_key = None
+    srv._enable_auto_tool_choice = False
+    srv._tool_call_parser = None
+    srv._tool_parser_instance = None
+    srv._reasoning_parser = None
     srv._default_chat_template_kwargs = None
 
     try:
@@ -52,6 +60,10 @@ def server_state():
         srv._responses_store = original_store
         srv._RESPONSES_STORE_MAX_SIZE = original_store_max_size
         srv._api_key = original_api_key
+        srv._enable_auto_tool_choice = original_enable_auto_tool_choice
+        srv._tool_call_parser = original_tool_call_parser
+        srv._tool_parser_instance = original_tool_parser_instance
+        srv._reasoning_parser = original_reasoning_parser
         srv._default_chat_template_kwargs = original_default_chat_template_kwargs
 
 

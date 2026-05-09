@@ -320,7 +320,7 @@ class TestCompletionStreamingRelease:
                 raise RuntimeError("generation failed")
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             acquires["count"] += 1
             return FakeEngine()
@@ -393,7 +393,7 @@ class TestCompletionStreamingRelease:
                 )
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return FakeEngine()
 
@@ -546,7 +546,7 @@ class TestToolParserUsesLocalEngine:
         local_engine = FakeEngine("tok-local")
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return local_engine
 
@@ -619,7 +619,7 @@ class TestLifecycleFailureHandling:
             preserve_native_tool_format = False
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             calls["acquires"] += 1
             return FakeEngine()
@@ -648,7 +648,7 @@ class TestLifecycleFailureHandling:
             preserve_native_tool_format = False
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             calls["acquires"] += 1
             return FakeEngine()
@@ -727,6 +727,7 @@ class TestLifecycleFailureHandling:
         monkeypatch.setattr(srv, "_engine", None, raising=False)
         monkeypatch.setattr(srv, "_residency_manager", fake_manager, raising=False)
         monkeypatch.setattr(srv, "_default_model_key", "default", raising=False)
+        monkeypatch.setattr(srv, "_is_client_disconnected", lambda request: True)
 
         total_timeout, deadline = srv._start_request_budget(60.0)
         result = await srv._acquire_default_engine_for_request(
@@ -2608,6 +2609,11 @@ class TestLifecycleFailureHandling:
         monkeypatch.setattr(srv, "_mcp_manager", None, raising=False)
         monkeypatch.setattr(srv, "_lifecycle_task", None, raising=False)
         monkeypatch.setattr(srv, "_lifespan_active", False, raising=False)
+        monkeypatch.setattr(
+            srv,
+            "_is_client_disconnected",
+            lambda request: disconnect_polled.set() or True,
+        )
 
         srv.load_model(
             "mlx-community/Qwen3-0.6B-8bit",
@@ -2731,6 +2737,11 @@ class TestLifecycleFailureHandling:
         monkeypatch.setattr(srv, "_mcp_manager", None, raising=False)
         monkeypatch.setattr(srv, "_lifecycle_task", None, raising=False)
         monkeypatch.setattr(srv, "_lifespan_active", False, raising=False)
+        monkeypatch.setattr(
+            srv,
+            "_is_client_disconnected",
+            lambda request: disconnect_polled.set() or True,
+        )
 
         srv.load_model(
             "mlx-community/Qwen3-0.6B-8bit",
@@ -2972,7 +2983,7 @@ class TestLifecycleFailureHandling:
 
     @pytest.mark.anyio
     async def test_wait_with_disconnect_treats_raced_task_cancellation_as_disconnect(
-        self,
+        self, monkeypatch
     ):
         """A raced cancelled task should not leak CancelledError past disconnect handling."""
         import vllm_mlx.server as srv
@@ -2992,6 +3003,11 @@ class TestLifecycleFailureHandling:
 
         task = asyncio.create_task(cancellable_work())
         task_ref["task"] = task
+        monkeypatch.setattr(
+            srv,
+            "_is_client_disconnected",
+            lambda request: task.cancel() or True,
+        )
 
         result = await srv._wait_with_disconnect(
             task,
@@ -3497,7 +3513,7 @@ class TestResponseModelFieldUsesServedName:
         served_name = "my-custom-served-name"
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return FakeEngine()
 
@@ -3544,7 +3560,7 @@ class TestResponseModelFieldUsesServedName:
         served_name = "my-custom-served-name"
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return FakeEngine()
 
@@ -3595,7 +3611,7 @@ class TestResponseModelFieldUsesServedName:
         served_name = "my-custom-served-name"
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return FakeEngine()
 

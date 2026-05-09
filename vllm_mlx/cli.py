@@ -34,13 +34,15 @@ def serve_command(args):
 
     logger = logging.getLogger(__name__)
 
-    if args.models_config and args.model:
+    models_config = getattr(args, "models_config", None)
+
+    if models_config and args.model:
         print("Error: use either positional MODEL or --models-config, not both")
         sys.exit(1)
-    if not args.models_config and not args.model:
+    if not models_config and not args.model:
         print("Error: MODEL is required unless --models-config is provided")
         sys.exit(1)
-    if args.models_config and args.served_model_name:
+    if models_config and args.served_model_name:
         print("Error: --served-model-name cannot be used with --models-config")
         sys.exit(1)
 
@@ -92,15 +94,19 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
-    server._default_chat_template_kwargs = args.default_chat_template_kwargs
+    default_chat_template_kwargs = args.default_chat_template_kwargs
+    if args.reasoning_parser and default_chat_template_kwargs is None:
+        default_chat_template_kwargs = {"enable_thinking": False}
+    server._default_chat_template_kwargs = default_chat_template_kwargs
     max_audio_upload_mb = getattr(args, "max_audio_upload_mb", 25)
     max_tts_input_chars = getattr(args, "max_tts_input_chars", 4096)
     server._max_audio_upload_bytes = max_audio_upload_mb * 1024 * 1024
     server._max_tts_input_chars = max_tts_input_chars
 
     # Configure thinking token budget
-    if args.default_thinking_token_budget is not None:
-        server._default_thinking_token_budget = args.default_thinking_token_budget
+    default_thinking_token_budget = getattr(args, "default_thinking_token_budget", None)
+    if default_thinking_token_budget is not None:
+        server._default_thinking_token_budget = default_thinking_token_budget
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -160,8 +166,8 @@ def serve_command(args):
         print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
     else:
         print("  Reasoning: Use --reasoning-parser to enable")
-    if args.default_thinking_token_budget is not None:
-        print(f"  Thinking budget: {args.default_thinking_token_budget} tokens")
+    if default_thinking_token_budget is not None:
+        print(f"  Thinking budget: {default_thinking_token_budget} tokens")
     print(
         f"  Audio upload limit: {max_audio_upload_mb} MiB, "
         f"TTS input limit: {max_tts_input_chars} chars"
@@ -189,11 +195,12 @@ def serve_command(args):
         else:
             print(f"Loading model: {args.model}")
     else:
-        print(f"Loading models config: {args.models_config}")
+        print(f"Loading models config: {models_config}")
     print(f"Default max tokens: {args.max_tokens}")
     print(f"Max request tokens: {max_request_tokens}")
-    if args.max_kv_size is not None:
-        print(f"Max KV size: {args.max_kv_size} (RotatingKVCache)")
+    max_kv_size = getattr(args, "max_kv_size", None)
+    if max_kv_size is not None:
+        print(f"Max KV size: {max_kv_size} (RotatingKVCache)")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -254,7 +261,7 @@ def serve_command(args):
             ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
             ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
             # KV cache size limit
-            max_kv_size=args.max_kv_size or 0,
+            max_kv_size=max_kv_size or 0,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -294,7 +301,7 @@ def serve_command(args):
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
 
-    if args.models_config:
+    if models_config:
         defaults = RegistryServeDefaults(
             continuous_batching=args.continuous_batching,
             force_mllm=getattr(args, "mllm", False),
@@ -310,7 +317,7 @@ def serve_command(args):
             max_tokens=args.max_tokens,
             download_config=download_config,
         )
-        load_model_registry(args.models_config, defaults=defaults)
+        load_model_registry(models_config, defaults=defaults)
     else:
         # Load model with unified server
         load_model(
