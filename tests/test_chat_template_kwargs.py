@@ -16,6 +16,70 @@ def anyio_backend():
     return "asyncio"
 
 
+def _serve_args(**overrides):
+    values = dict(
+        model="mlx-community/Qwen3-0.6B-8bit",
+        models_config=None,
+        host="127.0.0.1",
+        port=8000,
+        max_num_seqs=256,
+        prefill_batch_size=8,
+        completion_batch_size=32,
+        enable_prefix_cache=True,
+        disable_prefix_cache=False,
+        prefix_cache_size=100,
+        cache_memory_mb=None,
+        cache_memory_percent=0.20,
+        no_memory_aware_cache=False,
+        kv_cache_quantization=False,
+        kv_cache_quantization_bits=8,
+        kv_cache_quantization_group_size=64,
+        kv_cache_min_quantize_tokens=256,
+        stream_interval=1,
+        max_tokens=32768,
+        max_request_tokens=32768,
+        continuous_batching=False,
+        use_paged_cache=False,
+        paged_cache_block_size=64,
+        max_cache_blocks=1000,
+        chunked_prefill_tokens=0,
+        enable_mtp=False,
+        mtp_num_draft_tokens=1,
+        mtp_optimistic=False,
+        prefill_step_size=2048,
+        specprefill=False,
+        specprefill_threshold=8192,
+        specprefill_keep_pct=0.3,
+        specprefill_draft_model=None,
+        mcp_config=None,
+        api_key=None,
+        rate_limit=0,
+        timeout=300.0,
+        enable_auto_tool_choice=False,
+        tool_call_parser=None,
+        reasoning_parser=None,
+        mllm=False,
+        default_temperature=None,
+        default_top_p=None,
+        default_thinking_token_budget=None,
+        default_chat_template_kwargs=None,
+        served_model_name=None,
+        embedding_model=None,
+        rerank_model=None,
+        gpu_memory_utilization=0.90,
+        enable_metrics=False,
+        download_timeout=120,
+        download_retries=3,
+        offline=False,
+        mllm_prefill_step_size=0,
+        lazy_load_model=True,
+        auto_unload_idle_seconds=0.0,
+        max_kv_size=None,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_chat_completion_request_preserves_chat_template_kwargs():
     request = srv.ChatCompletionRequest(
         model="test-model",
@@ -158,6 +222,50 @@ def test_chat_completion_endpoint_applies_server_default_chat_template_kwargs():
     assert response.status_code == 200
     assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
+def test_serve_command_defaults_reasoning_parser_to_non_thinking_chat(monkeypatch):
+    import uvicorn
+
+    import vllm_mlx.cli as cli
+    import vllm_mlx.server as server
+    from vllm_mlx.utils import download
+
+    original_defaults = getattr(server, "_default_chat_template_kwargs", None)
+    monkeypatch.setattr(server, "load_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download, "ensure_model_downloaded", lambda *args, **kwargs: None)
+    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+
+    try:
+        cli.serve_command(_serve_args(reasoning_parser="qwen3"))
+        assert server._default_chat_template_kwargs == {"enable_thinking": False}
+    finally:
+        server._default_chat_template_kwargs = original_defaults
+
+
+def test_serve_command_preserves_explicit_chat_template_kwargs(monkeypatch):
+    import uvicorn
+
+    import vllm_mlx.cli as cli
+    import vllm_mlx.server as server
+    from vllm_mlx.utils import download
+
+    original_defaults = getattr(server, "_default_chat_template_kwargs", None)
+    monkeypatch.setattr(server, "load_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download, "ensure_model_downloaded", lambda *args, **kwargs: None)
+    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+
+    explicit = {"enable_thinking": True}
+    try:
+        cli.serve_command(
+            _serve_args(
+                reasoning_parser="qwen3",
+                default_chat_template_kwargs=explicit,
+            )
+        )
+        assert server._default_chat_template_kwargs == explicit
+    finally:
+        server._default_chat_template_kwargs = original_defaults
 
 
 def test_chat_completion_endpoint_request_kwargs_override_server_defaults():
