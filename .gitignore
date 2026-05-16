@@ -96,3 +96,6 @@ temp/
 
 # MLX cache
 .mlx_cache/
+
+# codex-review artifacts (local, not for upstream)
+.codex-reviews/
