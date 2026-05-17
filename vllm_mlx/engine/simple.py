@@ -7,6 +7,7 @@ performance when serving a single user at a time.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import threading
@@ -178,6 +179,12 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
         self._system_kv_token_count = 0  # Tokens in cached prefix
+        # True only when the model's prompt cache is composed entirely of
+        # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
+        # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
+        # aliases buffers ``update_and_fetch`` mutates in place — snapshot
+        # restore would silently desynchronize. Probed once in ``start()``.
+        self._supports_system_kv_cache: bool = False
 
     @property
     def model_name(self) -> str:
@@ -253,6 +260,36 @@ class SimpleEngine(BaseEngine):
                     self._mtp_num_draft_tokens,
                 )
 
+            # Probe whether this model's prompt cache is snapshot-safe for the
+            # stream_chat system-prefix cache branch. Sliding-window models
+            # (gemma3_text, olmo3, recurrent_gemma) return RotatingKVCache
+            # entries whose ``.state`` aliases in-place-mutated buffers.
+            # Only relevant for the LLM path; MLLM never enters the cache
+            # branch.
+            if not self._is_mllm and self._model is not None:
+                try:
+                    from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+                    probe_cache = make_prompt_cache(self._model.model)
+                    self._supports_system_kv_cache = bool(probe_cache) and all(
+                        isinstance(c, KVCache) for c in probe_cache
+                    )
+                    if not self._supports_system_kv_cache:
+                        cache_types = sorted({type(c).__name__ for c in probe_cache})
+                        logger.info(
+                            "System KV cache snapshot disabled: model returned "
+                            "non-KVCache entries (%s); stream_chat will use the "
+                            "uncached path",
+                            cache_types,
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "System KV cache support probe failed (%s); "
+                        "disabling snapshot path",
+                        e,
+                    )
+                    self._supports_system_kv_cache = False
+
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
             # on the slower mlx_vlm multimodal path.
@@ -310,6 +347,14 @@ class SimpleEngine(BaseEngine):
                     logger.error("SpecPrefill: draft model load failed: %s", e)
                     self._draft_model = None
 
+            # Warn if MTP is enabled without continuous-batching and text routing not available
+            if self._mtp and (not self._is_mllm or self._text_model is None):
+                logger.warning(
+                    "[MTP] --enable-mtp without --continuous-batching: "
+                    "speculative decoding via draft tokens will not be active. "
+                    "For full MTP support, use: --enable-mtp --continuous-batching"
+                )
+
             mtp_info = ""
             if self._mtp:
                 mtp_info = (
@@ -338,6 +383,7 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None
         self._system_kv_hash = None
         self._system_kv_token_count = 0
+        self._supports_system_kv_cache = False
         logger.info("SimpleEngine stopped")
 
     async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
@@ -860,7 +906,372 @@ class SimpleEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
 
-        # Stream generate
+        # --- System-prompt KV caching on the pure-LLM stream_chat path ---
+        # Mirrors the cache in _stream_generate_text. Locates the system prefix
+        # via probe-divergence (cf. prompt_warmup._build_strict_prefix_string):
+        # render the template with two different user contents and take the
+        # shared prefix. Works across Qwen/ChatML, Llama, Gemma, and any other
+        # chat format -- no per-model marker list. Falls back to the original
+        # uncached self.stream_generate() if the system prefix can't be
+        # isolated or any step of the cache-aware path raises.
+        cache_hit = False
+        suffix_tokens = None
+        system_tokens = None
+        system_token_count = 0
+        full_token_count = 0
+        system_hash = None
+        kv_cache_eligible = False
+        # Snapshot reference captured at gate time so a concurrent MISS that
+        # reassigns ``self._system_kv_snapshot`` between the gate and the
+        # restore (which runs later inside ``_run_blocking_serialized``)
+        # can't desynchronize the restored KV from the hash that decided HIT.
+        hit_snapshot: Any = None
+
+        # Decode-control gate.
+        # The cache branch below drives ``mlx_lm.stream_generate`` directly with only
+        # ``prompt``, ``max_tokens``, ``sampler`` (built from temperature+top_p), and
+        # ``prompt_cache``.
+        # The uncached fallback threads ``**kwargs`` through ``self.stream_generate``,
+        # which preserves ``stop``, request-local ``logits_processors`` (parser stop
+        # tokens and JSON-constrained decoding attached by server.py per request), and
+        # the ``top_k`` / ``min_p`` / ``presence_penalty`` / ``repetition_penalty``
+        # sampling controls.
+        # If the cache branch ran with any of those active, cache-eligible and uncached
+        # requests would silently decode under different constraints.
+        # Skip the cache branch in that case so both paths share identical decode
+        # semantics.
+        # server.py always supplies the no-op defaults (``top_k=0``, ``min_p=0.0``,
+        # ``presence_penalty=0.0``, ``repetition_penalty=1.0``); compare against those
+        # rather than ``key in kwargs`` so the common path still hits the cache.
+        cache_blocking_controls: list[str] = []
+        if kwargs.get("stop"):
+            cache_blocking_controls.append("stop")
+        if kwargs.get("logits_processors"):
+            cache_blocking_controls.append("logits_processors")
+        if (kwargs.get("top_k") or 0) > 0:
+            cache_blocking_controls.append("top_k")
+        if (kwargs.get("min_p") or 0.0) > 0.0:
+            cache_blocking_controls.append("min_p")
+        if (kwargs.get("presence_penalty") or 0.0) != 0.0:
+            cache_blocking_controls.append("presence_penalty")
+        if (kwargs.get("repetition_penalty") or 1.0) != 1.0:
+            cache_blocking_controls.append("repetition_penalty")
+
+        # Engine-feature gate.
+        # The cache branch also bypasses engine-level features that
+        # ``self.stream_generate`` (and the ``MLXLanguageModel.stream_generate``
+        # wrapper underneath it) layer on top of ``mlx_lm.stream_generate``.
+        # Same correctness reasoning as the decode-control gate: cache-eligible
+        # and uncached requests must decode under identical engine semantics, so
+        # skip the cache branch when any of these are active.
+        # Specifically:
+        #   - ``self._mtp`` injects ``mtp=True`` and ``num_draft_tokens`` into
+        #     the mlx-lm call (see ``MLXLanguageModel.stream_generate``).
+        #   - A loaded SpecPrefill draft model (``self._draft_model is not None``,
+        #     set when ``specprefill_enabled`` + ``specprefill_draft_model`` are
+        #     configured at engine init) routes large prompts through
+        #     ``_stream_generate_specprefill`` instead of the plain stream path.
+        #   - A per-request ``specprefill`` override from ``extra_body`` (popped
+        #     by the wrapper from ``kwargs``) can force or suppress SpecPrefill
+        #     for a single request.
+        #     ``specprefill=False`` is a meaningful suppression signal — gate on
+        #     ``is not None`` rather than truthiness so the wrapper sees it.
+        #   - ``self._max_kv_size`` (when > 0) caps the prompt cache; the cache
+        #     branch builds its cache with ``make_prompt_cache(model)`` and has
+        #     no equivalent bound.
+        if self._mtp:
+            cache_blocking_controls.append("mtp")
+        if self._draft_model is not None:
+            cache_blocking_controls.append("specprefill_loaded")
+        if kwargs.get("specprefill") is not None:
+            cache_blocking_controls.append("specprefill_request_override")
+        if (self._max_kv_size or 0) > 0:
+            cache_blocking_controls.append("max_kv_size")
+        # Sliding-window models build their prompt cache from RotatingKVCache
+        # entries whose ``.state`` aliases buffers that ``update_and_fetch``
+        # mutates in place. Snapshot capture would corrupt the cached prefix
+        # on the next decode. Probed once at start; ``False`` if the model
+        # exposes any non-KVCache entries or the probe failed.
+        if not self._supports_system_kv_cache:
+            cache_blocking_controls.append("non_kv_cache_class")
+
+        if cache_blocking_controls:
+            logger.info(
+                "System KV cache SKIP (stream_chat): request or engine has "
+                "controls/features the cache branch cannot honor (%s); using "
+                "uncached path",
+                cache_blocking_controls,
+            )
+
+        # Normalize messages to plain dicts. The public stream_chat signature
+        # types messages as list[dict], but internal callers (server.py,
+        # tests) sometimes pass Pydantic Message objects directly; those
+        # don't expose a dict-style .get() interface.
+        def _to_msg_dict(m: Any) -> dict[str, Any]:
+            if isinstance(m, dict):
+                return m
+            if hasattr(m, "model_dump"):
+                return m.model_dump()
+            if hasattr(m, "dict"):
+                return m.dict()
+            return {
+                "role": getattr(m, "role", None),
+                "content": getattr(m, "content", ""),
+            }
+
+        messages_for_cache = [_to_msg_dict(m) for m in messages]
+        has_system = any(m.get("role") == "system" for m in messages_for_cache)
+        if (
+            has_system
+            and not cache_blocking_controls
+            and hasattr(tokenizer, "apply_chat_template")
+        ):
+
+            def _with_user(user_content: str) -> list[dict[str, Any]]:
+                msgs = [dict(m) for m in messages_for_cache]
+                if msgs and msgs[-1].get("role") == "user":
+                    msgs[-1] = {**msgs[-1], "content": user_content}
+                else:
+                    msgs = [*msgs, {"role": "user", "content": user_content}]
+                return msgs
+
+            rendered_a: Any = None
+            rendered_b: Any = None
+            try:
+                rendered_a = tokenizer.apply_chat_template(
+                    _with_user("Alpha"), **template_kwargs
+                )
+                rendered_b = tokenizer.apply_chat_template(
+                    _with_user("Bravo"), **template_kwargs
+                )
+            except Exception:
+                pass
+
+            if isinstance(rendered_a, str) and isinstance(rendered_b, str):
+                boundary = 0
+                diverged = False
+                for i in range(min(len(rendered_a), len(rendered_b))):
+                    if rendered_a[i] != rendered_b[i]:
+                        diverged = True
+                        break
+                    boundary = i + 1
+
+                if diverged and boundary >= 16:
+                    system_prefix_text = rendered_a[:boundary]
+                    system_hash = hashlib.sha256(
+                        system_prefix_text.encode()
+                    ).hexdigest()[:16]
+
+                    add_special = tokenizer.bos_token is None or not prompt.startswith(
+                        tokenizer.bos_token
+                    )
+                    full_tokens_list = tokenizer.encode(
+                        prompt, add_special_tokens=add_special
+                    )
+                    system_tokens_list = tokenizer.encode(
+                        system_prefix_text, add_special_tokens=add_special
+                    )
+                    full_token_count = len(full_tokens_list)
+                    system_token_count = len(system_tokens_list)
+
+                    if (
+                        len(full_tokens_list) > system_token_count
+                        and full_tokens_list[:system_token_count] == system_tokens_list
+                    ):
+                        system_tokens = system_tokens_list
+                        suffix_tokens = full_tokens_list[system_token_count:]
+                        kv_cache_eligible = True
+                        # Read the snapshot reference once. If we promote to
+                        # HIT, ``hit_snapshot`` is the exact list the hash
+                        # check just validated against. A later concurrent
+                        # MISS that reassigns ``self._system_kv_snapshot``
+                        # before our serialized worker restores it cannot
+                        # alias what we captured here.
+                        candidate_snapshot = self._system_kv_snapshot
+                        if (
+                            system_hash == self._system_kv_hash
+                            and candidate_snapshot is not None
+                            and system_token_count == self._system_kv_token_count
+                        ):
+                            cache_hit = True
+                            hit_snapshot = candidate_snapshot
+                            logger.info(
+                                "System KV cache HIT (stream_chat): reusing %d "
+                                "tokens, prefilling %d new (hash=%s)",
+                                system_token_count,
+                                len(suffix_tokens),
+                                system_hash,
+                            )
+                        else:
+                            logger.info(
+                                "System KV cache MISS (stream_chat): will "
+                                "prefill %d system + %d suffix tokens (hash=%s)",
+                                system_token_count,
+                                len(suffix_tokens),
+                                system_hash,
+                            )
+
+        if kv_cache_eligible:
+            # Cache-aware path: drive mlx-lm directly with a pre-populated cache.
+            # Stream chunks back to the caller via an asyncio.Queue (mirrors
+            # _stream_generate_text) so the client sees tokens as they arrive
+            # rather than after the full generation finishes.
+            loop = asyncio.get_running_loop()
+            response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            abort_event = threading.Event()
+
+            def _emit_response(resp: Any) -> None:
+                if abort_event.is_set():
+                    return
+                loop.call_soon_threadsafe(response_queue.put_nowait, ("resp", resp))
+
+            def _emit_done() -> None:
+                loop.call_soon_threadsafe(response_queue.put_nowait, ("done", None))
+
+            def _emit_error(exc: BaseException) -> None:
+                loop.call_soon_threadsafe(response_queue.put_nowait, ("error", exc))
+
+            def _run_with_cache() -> None:
+                from mlx_lm import stream_generate as mlx_stream_generate
+                from mlx_lm.models.cache import make_prompt_cache
+                from mlx_lm.sample_utils import make_sampler
+
+                model = self._model.model
+                sampler = make_sampler(temp=temperature, top_p=top_p)
+
+                if cache_hit:
+                    bc = make_prompt_cache(model)
+                    # Restore from the closure-local reference captured at the
+                    # gate, never from ``self._system_kv_snapshot`` directly:
+                    # a concurrent MISS could have replaced the instance
+                    # attribute with a snapshot for a different system prefix
+                    # between the gate check and this point.
+                    for i, saved_state in enumerate(hit_snapshot):
+                        bc[i].state = saved_state
+                else:
+                    bc = make_prompt_cache(model)
+                    sys_arr = mx.array(system_tokens)
+                    step = self._prefill_step_size
+                    while sys_arr.size > step:
+                        model(sys_arr[:step][None], cache=bc)
+                        mx.eval([c.state for c in bc])
+                        sys_arr = sys_arr[step:]
+                        mx.clear_cache()
+                    if sys_arr.size > 0:
+                        model(sys_arr[None], cache=bc)
+                        mx.eval([c.state for c in bc])
+
+                    # Free intermediate prefill activations before snapshotting.
+                    # Intentionally stricter than the MLLM path, which does not
+                    # ``mx.clear_cache()`` between its last prefill chunk and
+                    # the snapshot; here we want the snapshot to reflect only
+                    # the KV state, not residual activations from prefill.
+                    mx.clear_cache()
+
+                    snapshot = [c.state for c in bc]
+                    mx.eval([s for pair in snapshot for s in pair])
+                    self._system_kv_snapshot = snapshot
+                    self._system_kv_hash = system_hash
+                    self._system_kv_token_count = system_token_count
+                    try:
+                        cache_mb = sum(c.nbytes for c in bc) / 1e6
+                    except Exception:
+                        cache_mb = -1
+                    logger.info(
+                        "System KV cache STORED (stream_chat): %d tokens " "(%.1f MB)",
+                        system_token_count,
+                        cache_mb,
+                    )
+
+                prompt_arr = mx.array(suffix_tokens)
+                for resp in mlx_stream_generate(
+                    model,
+                    tokenizer,
+                    prompt=prompt_arr,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    prompt_cache=bc,
+                ):
+                    if abort_event.is_set():
+                        break
+                    _emit_response(resp)
+
+            async def _produce_responses() -> None:
+                try:
+                    await self._run_blocking_serialized(
+                        _run_with_cache,
+                        on_cancel=abort_event.set,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    _emit_error(exc)
+                else:
+                    _emit_done()
+
+            producer_task = asyncio.create_task(_produce_responses())
+
+            accumulated_text = ""
+            token_count = 0
+            finished = False
+            cache_path_failed_before_first_token = False
+            try:
+                while True:
+                    kind, payload = await response_queue.get()
+                    if kind == "done":
+                        break
+                    if kind == "error":
+                        if token_count == 0:
+                            logger.warning(
+                                "Pure-LLM KV-cache path failed before first "
+                                "token (%s); falling back to uncached "
+                                "stream_generate",
+                                payload,
+                            )
+                            cache_path_failed_before_first_token = True
+                            break
+                        # Already streamed partial output; can't cleanly
+                        # restart on the uncached path, so surface the error.
+                        raise payload
+                    resp = payload
+                    token_count += 1
+                    new_text = resp.text if hasattr(resp, "text") else str(resp)
+                    accumulated_text += new_text
+                    finish_reason = getattr(resp, "finish_reason", None)
+                    finished = finish_reason is not None or token_count >= max_tokens
+                    if finish_reason is None and finished:
+                        finish_reason = "stop"
+
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=full_token_count,
+                        completion_tokens=token_count,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                    )
+                    if finished:
+                        break
+            finally:
+                if not producer_task.done():
+                    abort_event.set()
+                    try:
+                        await producer_task
+                    except BaseException:
+                        pass
+
+            if cache_path_failed_before_first_token:
+                async for output in self.stream_generate(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    **kwargs,
+                ):
+                    yield output
+            return
+
+        # Fallback: no system prefix detected -> original uncached path
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -1356,7 +1767,6 @@ class SimpleEngine(BaseEngine):
                 # a fresh MTP cache so stale speculative state cannot survive the
                 # processor-to-content handoff.
                 resume_kwargs["prompt_cache"] = prompt_cache + model.make_mtp_cache()
-                resume_kwargs["mtp"] = True
                 resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
             for resp in mlx_stream_generate(
                 model,
@@ -1457,7 +1867,6 @@ class SimpleEngine(BaseEngine):
             if all_processors:
                 gen_kwargs["logits_processors"] = all_processors
             if use_mtp:
-                gen_kwargs["mtp"] = True
                 gen_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
             if prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = prompt_cache

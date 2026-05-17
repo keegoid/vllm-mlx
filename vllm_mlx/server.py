@@ -825,6 +825,23 @@ _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
 _STREAMING_TOOL_MARKUP_SCAN_CHARS = 512
 
 
+def _strip_backslash_before_unicode(obj: object) -> object:
+    """Remove spurious backslashes before non-ASCII chars in JSON string values.
+
+    lm-format-enforcer's grammar allows ``\\`` (valid JSON escape) followed by
+    non-ASCII characters such as Korean syllables.  The model therefore generates
+    ``\\빠\\르\\게`` — valid JSON whose decoded value contains literal backslashes.
+    This helper strips those spurious backslashes so clients receive clean text.
+    """
+    if isinstance(obj, dict):
+        return {k: _strip_backslash_before_unicode(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_backslash_before_unicode(v) for v in obj]
+    if isinstance(obj, str):
+        return re.sub(r"\\([^\x00-\x7F])", r"\1", obj)
+    return obj
+
+
 def _sanitize_log_text(value: object, limit: int | None = None) -> str:
     """Escape control characters before logging untrusted text."""
     text = str(value)
@@ -1344,7 +1361,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="vllm-mlx API",
     description="OpenAI-compatible API for MLX LLM/MLLM inference on Apple Silicon",
-    version="0.2.9",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -3173,6 +3190,7 @@ async def status():
         "cache": stats.get("memory_aware_cache")
         or stats.get("paged_cache")
         or stats.get("prefix_cache"),
+        "mtp": stats.get("mtp") or {"enabled": False},
         "requests": stats.get("requests", []),
     }
 
@@ -4296,16 +4314,14 @@ async def _acquire_default_engine_for_request(
 
 
 async def _release_engine_for_request(
-    raw_request: Request | None,
-    *,
-    count_activity: bool = True,
+    raw_request: Request | None, *, count_activity: bool = True
 ) -> None:
     """Release the engine acquired for this request.
 
     In registry mode, releases the model lease stashed by
     ``_acquire_default_engine_for_request``.  In single-model mode, falls
-    through to the default release path while preserving whether the request
-    should refresh idle-unload activity.
+    through to the default release path.  ``count_activity`` must match the
+    flag used on the matching acquire so idle-unload accounting stays correct.
     """
     if raw_request is not None:
         ctx = _active_request_contexts.pop(id(raw_request), None)
@@ -4636,7 +4652,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             )
             if parsed_json is not None:
                 # Return JSON as string
-                cleaned_text = json.dumps(parsed_json)
+                parsed_json = _strip_backslash_before_unicode(parsed_json)
+                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
             if not is_valid:
                 if prepared.json_logits_processor is not None:
                     logger.error(
@@ -5059,7 +5076,8 @@ async def create_anthropic_message(
                 json_input, prepared.response_format
             )
             if parsed_json is not None:
-                cleaned_text = json.dumps(parsed_json)
+                parsed_json = _strip_backslash_before_unicode(parsed_json)
+                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
             if not is_valid:
                 if prepared.json_logits_processor is not None:
                     logger.error(
@@ -5637,6 +5655,15 @@ async def stream_chat_completion(
     start_time = time.perf_counter()
     result_label = "success"
 
+    # Tools schema for argument coercion is invariant for the request;
+    # compute once instead of model_dump()-ing the whole request on every
+    # tool-call delta during streaming.
+    tools_dict = (
+        request.model_dump(include={"tools"}).get("tools")
+        if request and request.tools
+        else None
+    )
+
     # Check if we should include usage in the final chunk
     include_usage = request.stream_options and request.stream_options.include_usage
 
@@ -5783,17 +5810,12 @@ async def stream_chat_completion(
                             # Emit structured tool calls
                             tool_calls_detected = True
                             # Coerce arguments against tool schemas
-                            tools = (
-                                request.model_dump().get("tools")
-                                if request and request.tools
-                                else None
-                            )
-                            if tools:
+                            if tools_dict:
                                 for tc in tool_result["tool_calls"]:
                                     fn = tc.get("function", {})
                                     if "arguments" in fn and "name" in fn:
                                         fn["arguments"] = _coerce_tool_arguments(
-                                            fn["arguments"], fn["name"], tools
+                                            fn["arguments"], fn["name"], tools_dict
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
@@ -5891,17 +5913,12 @@ async def stream_chat_completion(
                             # Emit structured tool calls
                             tool_calls_detected = True
                             # Coerce arguments against tool schemas
-                            tools = (
-                                request.model_dump().get("tools")
-                                if request and request.tools
-                                else None
-                            )
-                            if tools:
+                            if tools_dict:
                                 for tc in tool_result["tool_calls"]:
                                     fn = tc.get("function", {})
                                     if "arguments" in fn and "name" in fn:
                                         fn["arguments"] = _coerce_tool_arguments(
-                                            fn["arguments"], fn["name"], tools
+                                            fn["arguments"], fn["name"], tools_dict
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
@@ -5964,11 +5981,6 @@ async def stream_chat_completion(
         ):
             final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
             if final_parse_result.tools_called:
-                tools = (
-                    request.model_dump().get("tools")
-                    if request and request.tools
-                    else None
-                )
                 tool_chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_model_name,
@@ -5983,7 +5995,7 @@ async def stream_chat_completion(
                                         "function": {
                                             "name": tc["name"],
                                             "arguments": _coerce_tool_arguments(
-                                                tc["arguments"], tc["name"], tools
+                                                tc["arguments"], tc["name"], tools_dict
                                             ),
                                         },
                                     }
