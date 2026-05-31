@@ -15,6 +15,8 @@ Features:
 
 import atexit
 import base64
+from importlib.metadata import PackageNotFoundError, version
+import json
 import ipaddress
 import logging
 import math
@@ -132,6 +134,149 @@ class UnsafeRemoteURLError(ValueError):
         self.public_message = public_message
 
 
+def _normalize_content_part(item: object) -> object:
+    """Convert Pydantic content parts into plain Python objects."""
+    if hasattr(item, "model_dump"):
+        return item.model_dump(exclude_none=True)
+    if hasattr(item, "dict"):
+        return {k: v for k, v in item.dict().items() if v is not None}
+    return item
+
+
+def _extract_media_url(item: dict, item_type: str) -> str:
+    if item_type == "image_url":
+        media_value = item.get("image_url", {})
+    elif item_type == "video_url":
+        media_value = item.get("video_url", {})
+    elif item_type == "audio_url":
+        media_value = item.get("audio_url", {})
+    elif item_type in {"image", "video", "audio"}:
+        media_value = item.get(item_type, item.get("url", ""))
+    else:
+        return ""
+
+    if isinstance(media_value, dict):
+        media_value = media_value.get("url", "")
+    return media_value if isinstance(media_value, str) else ""
+
+
+def _text_content_part(text: str) -> dict[str, str]:
+    return {"type": "text", "text": text, "content": text}
+
+
+def _append_text_content_part(
+    built_parts: list[dict[str, str]], text_parts: list[str], text: str
+) -> None:
+    if not text:
+        return
+    built_parts.append(_text_content_part(text))
+    text_parts.append(text)
+
+
+def _build_string_mllm_message_content(content: str, role: str) -> tuple[object, bool]:
+    if not content:
+        return "", False
+    if role == "assistant":
+        return content, True
+    return [_text_content_part(content)], True
+
+
+def _append_ordered_mllm_content_part(
+    raw_item: object,
+    *,
+    built_parts: list[dict[str, str]],
+    text_parts: list[str],
+    all_image_urls: list[str],
+    video_frame_count: int,
+) -> int:
+    item = _normalize_content_part(raw_item)
+    if isinstance(item, str):
+        _append_text_content_part(built_parts, text_parts, item)
+        return video_frame_count
+
+    if not isinstance(item, dict):
+        return video_frame_count
+
+    item_type = item.get("type", "")
+    if item_type in {"text", "input_text"}:
+        _append_text_content_part(
+            built_parts, text_parts, item.get("text", "") or item.get("content", "")
+        )
+    elif item_type in {"image_url", "image"}:
+        media_url = _extract_media_url(item, item_type)
+        if media_url:
+            all_image_urls.append(media_url)
+        built_parts.append({"type": "image"})
+    elif item_type in {"audio_url", "audio"}:
+        # Audio inputs are collected once by _collect_audio_inputs before
+        # message reconstruction; this helper only preserves placeholder order.
+        built_parts.append({"type": "audio"})
+    elif item_type in {"video", "video_url"}:
+        # Native video models bypass this helper. For fallback frame extraction,
+        # preserve the video position by inserting that message's frames here.
+        built_parts.extend({"type": "image"} for _ in range(video_frame_count))
+        return 0
+    return video_frame_count
+
+
+def _build_ordered_mllm_message_content(
+    content: object,
+    *,
+    role: str,
+    all_image_urls: list[str],
+    video_frame_count: int = 0,
+) -> tuple[object, bool]:
+    """Build template content while preserving OpenAI media/text part order."""
+    if isinstance(content, str):
+        return _build_string_mllm_message_content(content, role)
+
+    if not isinstance(content, list):
+        return "", False
+
+    built_parts: list[dict[str, str]] = []
+    text_parts: list[str] = []
+    remaining_video_frames = video_frame_count
+
+    for raw_item in content:
+        remaining_video_frames = _append_ordered_mllm_content_part(
+            raw_item,
+            built_parts=built_parts,
+            text_parts=text_parts,
+            all_image_urls=all_image_urls,
+            video_frame_count=remaining_video_frames,
+        )
+
+    if role == "assistant":
+        text = "".join(text_parts)
+        return text, bool(text)
+
+    return built_parts, bool(built_parts)
+
+
+def _build_mllm_chat_messages(
+    messages: list[dict],
+    *,
+    all_image_urls: list[str],
+    video_frame_counts: dict[int, int],
+) -> list[dict]:
+    """Build chat-template messages without reordering multimodal content parts."""
+    chat_messages: list[dict] = []
+    for msg_idx, msg in enumerate(messages):
+        role = msg.get("role", "user")
+        if not isinstance(role, str):
+            role = str(role)
+
+        content, has_content = _build_ordered_mllm_message_content(
+            msg.get("content", ""),
+            role=role,
+            all_image_urls=all_image_urls,
+            video_frame_count=video_frame_counts.get(msg_idx, 0),
+        )
+        if has_content:
+            chat_messages.append({"role": role, "content": content})
+    return chat_messages
+
+
 @dataclass
 class MultimodalInput:
     """Input for multimodal generation."""
@@ -150,6 +295,99 @@ class MLLMOutput:
     finish_reason: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
+
+
+def load_gemma4_assistant_drafter(model_path: str):
+    """Load a Gemma 4 assistant drafter for mlx-vlm speculative decoding."""
+    try:
+        import mlx.core as mx
+        from mlx_vlm.speculative.drafters import gemma4_assistant as arch
+    except ImportError as exc:
+        raise ImportError(
+            "Gemma 4 assistant drafter support requires an mlx-vlm build that "
+            "provides mlx_vlm.speculative.drafters.gemma4_assistant."
+        ) from exc
+
+    try:
+        mlx_vlm_version = version("mlx-vlm")
+    except PackageNotFoundError:
+        mlx_vlm_version = "unknown"
+    logger.info(
+        "Loading Gemma 4 assistant drafter from %s using mlx-vlm %s",
+        model_path,
+        mlx_vlm_version,
+    )
+
+    path = Path(model_path)
+    config_path = path / "config.json"
+    weight_paths = sorted(path.glob("*.safetensors"))
+    if not config_path.exists():
+        raise FileNotFoundError(f"Gemma 4 assistant config not found: {config_path}")
+    if not weight_paths:
+        raise FileNotFoundError(f"Gemma 4 assistant weights not found: {path}")
+
+    config = arch.ModelConfig.from_dict(
+        json.loads(config_path.read_text(encoding="utf-8"))
+    )
+    model = arch.Model(config)
+    weights = {}
+    for weight_path in weight_paths:
+        weights.update(mx.load(str(weight_path)))
+    if hasattr(model, "sanitize"):
+        weights = model.sanitize(weights)
+    model.load_weights(list(weights.items()))
+    mx.eval(model.parameters())
+    model.eval()
+    return model
+
+
+_DRAFT_KWARG_NAMES = ("draft_model", "draft_kind", "draft_block_size")
+
+
+def _count_draft_tokens(draft_tokens) -> int:
+    """Best-effort drafted-token count for an mlx-vlm drafter output."""
+    shape = getattr(draft_tokens, "shape", None)
+    if shape:
+        try:
+            return max(int(shape[-1]), 0)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(len(draft_tokens), 0)
+    except TypeError:
+        return 0
+
+
+def _install_draft_metrics_hooks(draft_model) -> None:
+    """Record actual drafted token counts from mlx-vlm assistant drafters."""
+    if draft_model is None or getattr(draft_model, "_vllm_mlx_metrics_hooked", False):
+        return
+
+    if not hasattr(draft_model, "_vllm_mlx_draft_counts"):
+        draft_model._vllm_mlx_draft_counts = []
+
+    draft_block = getattr(draft_model, "draft_block", None)
+    if callable(draft_block):
+
+        def draft_block_with_metrics(*args, **kwargs):
+            draft_tokens = draft_block(*args, **kwargs)
+            draft_model._vllm_mlx_draft_counts.append(_count_draft_tokens(draft_tokens))
+            return draft_tokens
+
+        draft_model.draft_block = draft_block_with_metrics
+
+    reset = getattr(draft_model, "reset", None)
+    if callable(reset):
+
+        def reset_with_metrics(*args, **kwargs):
+            draft_model._vllm_mlx_draft_counts = []
+            return reset(*args, **kwargs)
+
+        draft_model.reset = reset_with_metrics
+
+    draft_model._vllm_mlx_metrics_hooked = True
 
 
 def is_base64_image(s: str) -> bool:
@@ -863,6 +1101,9 @@ class MLXMultimodalLM:
         enable_cache: bool = True,
         cache_size: int = 50,
         max_kv_size: int = 0,
+        draft_model: str | None = None,
+        draft_kind: str | None = None,
+        draft_block_size: int | None = None,
     ):
         """
         Initialize the MLX multimodal language model.
@@ -873,15 +1114,22 @@ class MLXMultimodalLM:
             enable_cache: Enable KV cache for repeated image/video+prompt (default: True)
             cache_size: Maximum cache entries (default: 50)
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            draft_model: Optional MLLM speculative draft/assistant model path.
+            draft_kind: Optional mlx-vlm draft kind, for example "mtp".
+            draft_block_size: Optional speculative block size passed to mlx-vlm.
         """
         self.model_name = model_name
         self.trust_remote_code = trust_remote_code
         self.enable_cache = enable_cache
         self.max_kv_size = max_kv_size
+        self.draft_model_path = draft_model
+        self.draft_kind = draft_kind
+        self.draft_block_size = draft_block_size
 
         self.model = None
         self.processor = None
         self.config = None
+        self._draft_model = None
         self._loaded = False
         self._video_native = False
 
@@ -903,6 +1151,9 @@ class MLXMultimodalLM:
 
             self.model, self.processor = load(self.model_name)
             self.config = load_config(self.model_name)
+            if self.draft_model_path:
+                self._draft_model = self._load_draft_model()
+                _install_draft_metrics_hooks(self._draft_model)
 
             self._loaded = True
             self._video_native = hasattr(
@@ -920,6 +1171,78 @@ class MLXMultimodalLM:
         except Exception as e:
             logger.error(f"Failed to load MLLM: {e}")
             raise
+
+    def _load_draft_model(self):
+        if self.draft_kind == "mtp":
+            return load_gemma4_assistant_drafter(self.draft_model_path)
+
+        from mlx_vlm.utils import load
+
+        draft_model, _ = load(self.draft_model_path)
+        return draft_model
+
+    def _draft_generation_kwargs(self, call_kwargs: dict | None = None) -> dict:
+        """Return mlx-vlm drafter kwargs when the request explicitly opts in.
+
+        ``call_kwargs`` is the outbound mlx-vlm kwargs dict. This method removes
+        vllm-mlx drafter control keys before the dict is forwarded so caller
+        passthrough values cannot conflict with the configured server drafter.
+        """
+        draft_requested = False
+        if call_kwargs is not None:
+            draft_requested = bool(call_kwargs.pop("mllm_draft", False))
+            for key in _DRAFT_KWARG_NAMES:
+                call_kwargs.pop(key, None)
+        if not draft_requested or self._draft_model is None:
+            return {}
+        # Tests may install the draft model after load(); the hook is idempotent.
+        _install_draft_metrics_hooks(self._draft_model)
+        kwargs = {"draft_model": self._draft_model}
+        if self.draft_kind:
+            kwargs["draft_kind"] = self.draft_kind
+        if self.draft_block_size is not None:
+            kwargs["draft_block_size"] = self.draft_block_size
+        return kwargs
+
+    def _reset_draft_metrics(self) -> int:
+        if self._draft_model is None:
+            return 0
+        if hasattr(self._draft_model, "accept_lens"):
+            self._draft_model.accept_lens = []
+        if hasattr(self._draft_model, "_vllm_mlx_draft_counts"):
+            self._draft_model._vllm_mlx_draft_counts = []
+        return 0
+
+    def _draft_metrics_since(self, start_accept_lens: int) -> dict[str, int]:
+        if self._draft_model is None:
+            return {"mtp_drafts": 0, "mtp_accepted": 0}
+        accept_lens = list(getattr(self._draft_model, "accept_lens", []))
+        if start_accept_lens > len(accept_lens):
+            new_accept_lens = accept_lens
+        else:
+            new_accept_lens = accept_lens[start_accept_lens:]
+        draft_counts = list(getattr(self._draft_model, "_vllm_mlx_draft_counts", []))
+        if start_accept_lens > len(draft_counts):
+            new_draft_counts = draft_counts
+        else:
+            new_draft_counts = draft_counts[start_accept_lens:]
+        block_size = (
+            int(self.draft_block_size)
+            if self.draft_block_size is not None
+            else int(
+                getattr(getattr(self._draft_model, "config", None), "block_size", 0)
+            )
+        )
+        drafted_per_round = max(block_size - 1, 0)
+        mtp_drafts = (
+            sum(max(int(value), 0) for value in new_draft_counts)
+            if new_draft_counts
+            else drafted_per_round * len(new_accept_lens)
+        )
+        return {
+            "mtp_drafts": mtp_drafts,
+            "mtp_accepted": sum(int(value) for value in new_accept_lens),
+        }
 
     def get_language_model(self):
         """Extract the underlying language model for mlx_lm TextModel construction."""
@@ -1391,6 +1714,7 @@ class MLXMultimodalLM:
                 prompt_cache = None
 
         # Generate with cache
+        draft_accept_start = self._reset_draft_metrics()
         result = generate(
             self.model,
             self.processor,
@@ -1402,8 +1726,10 @@ class MLXMultimodalLM:
             top_p=top_p,
             verbose=False,
             prompt_cache=prompt_cache,
+            **self._draft_generation_kwargs(kwargs),
             **kwargs,
         )
+        draft_metrics = self._draft_metrics_since(draft_accept_start)
 
         # Store cache for future reuse (only on miss)
         if use_cache and self._cache_manager and all_sources and not cache_hit:
@@ -1432,6 +1758,7 @@ class MLXMultimodalLM:
             finish_reason="stop",
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
+            **draft_metrics,
         )
 
     def stream_generate(
@@ -1520,6 +1847,7 @@ class MLXMultimodalLM:
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
             temp=temperature,
+            **self._draft_generation_kwargs(kwargs),
             **kwargs,
         ):
             yield chunk
@@ -1602,81 +1930,11 @@ class MLXMultimodalLM:
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
 
-        # Second pass: build chat messages with image counts that include video frames
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""  # Text content for this message
-            msg_image_count = 0  # Number of images in THIS message
-            msg_audio_count = 0  # Number of audio clips in THIS message
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                # OpenAI multimodal format - extract text and count images for THIS message
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    # Convert Pydantic models to dicts, excluding None fields
-                    # to avoid null keys like image_url: null on text parts
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            # Add video frame count to image count for this message
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-            msg_audio_count += len(_msg_audio_inputs.get(msg_idx, []))
-
-            # Build properly structured message
-            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "audio"}, ..., {"type": "text", "text": "..."}]}
-            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
-                if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
-                    # User message WITH images/audio - build content array with media tokens FIRST
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    for _ in range(msg_audio_count):
-                        content_list.append({"type": "audio"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    # Assistant messages - just text content (not array)
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    # User/system message WITHOUT images - still use content array format
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        chat_messages = _build_mllm_chat_messages(
+            messages,
+            all_image_urls=all_image_urls,
+            video_frame_counts=_msg_video_frame_counts,
+        )
 
         # Process images
         all_images = []
@@ -1833,6 +2091,7 @@ class MLXMultimodalLM:
             except Exception:
                 prompt_cache = None
 
+        draft_accept_start = self._reset_draft_metrics()
         result = generate(
             self.model,
             self.processor,
@@ -1844,8 +2103,10 @@ class MLXMultimodalLM:
             verbose=False,
             prompt_cache=prompt_cache,
             skip_prompt_processing=skip_prompt_processing,
+            **self._draft_generation_kwargs(kwargs),
             **kwargs,
         )
+        draft_metrics = self._draft_metrics_since(draft_accept_start)
 
         # Store KV cache for future reuse (on cache miss)
         # IMPORTANT: We need to store only the prompt portion, not generated tokens
@@ -1928,6 +2189,7 @@ class MLXMultimodalLM:
             finish_reason="stop",
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
+            **draft_metrics,
         )
 
     def stream_chat(
@@ -2024,70 +2286,11 @@ class MLXMultimodalLM:
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
 
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""
-            msg_image_count = 0
-            msg_audio_count = 0
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-            msg_audio_count += len(_msg_audio_inputs.get(msg_idx, []))
-            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
-                if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    for _ in range(msg_audio_count):
-                        content_list.append({"type": "audio"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        chat_messages = _build_mllm_chat_messages(
+            messages,
+            all_image_urls=all_image_urls,
+            video_frame_counts=_msg_video_frame_counts,
+        )
 
         all_images = []
         if all_image_urls:
@@ -2157,6 +2360,7 @@ class MLXMultimodalLM:
         # Stream generate tokens with cache
         accumulated_text = ""
         token_count = 0
+        draft_accept_start = self._reset_draft_metrics()
 
         for chunk in stream_generate(
             self.model,
@@ -2167,6 +2371,7 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temp=temperature,
             prompt_cache=prompt_cache,
+            **self._draft_generation_kwargs(kwargs),
             **kwargs,
         ):
             token_count += 1
@@ -2187,6 +2392,7 @@ class MLXMultimodalLM:
             finish_reason="stop",
             prompt_tokens=getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0,
             completion_tokens=token_count,
+            **self._draft_metrics_since(draft_accept_start),
         )
 
     def describe_image(

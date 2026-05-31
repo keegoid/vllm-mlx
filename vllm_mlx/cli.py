@@ -16,7 +16,7 @@ import argparse
 import json
 import sys
 
-from .cli_arg_types import make_json_object_arg_parser
+from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
 
 
 def serve_command(args):
@@ -33,13 +33,13 @@ def serve_command(args):
     from .server import RateLimiter, app, load_model, load_model_registry
 
     logger = logging.getLogger(__name__)
-
+    model_arg = getattr(args, "model", None)
     models_config = getattr(args, "models_config", None)
 
-    if models_config and args.model:
+    if models_config and model_arg:
         print("Error: use either positional MODEL or --models-config, not both")
         sys.exit(1)
-    if not models_config and not args.model:
+    if not models_config and not model_arg:
         print("Error: MODEL is required unless --models-config is provided")
         sys.exit(1)
     if models_config and args.served_model_name:
@@ -62,12 +62,33 @@ def serve_command(args):
         print("Error: --max-tokens must be at least 1")
         sys.exit(1)
     max_request_tokens = getattr(args, "max_request_tokens", args.max_tokens)
+    max_kv_size = getattr(args, "max_kv_size", None)
     trust_remote_code = getattr(args, "trust_remote_code", False)
     if max_request_tokens < 1:
         print("Error: --max-request-tokens must be at least 1")
         sys.exit(1)
     if args.max_tokens > max_request_tokens:
         print("Error: --max-tokens cannot exceed --max-request-tokens")
+        sys.exit(1)
+    mllm_draft_model = getattr(args, "mllm_draft_model", None)
+    mllm_draft_kind = getattr(args, "mllm_draft_kind", None)
+    mllm_draft_block_size = getattr(args, "mllm_draft_block_size", None)
+    if mllm_draft_model and models_config:
+        print("Error: --mllm-draft-model cannot be used with --models-config")
+        sys.exit(1)
+    if mllm_draft_model and not getattr(args, "mllm", False):
+        print("Error: --mllm-draft-model requires --mllm")
+        sys.exit(1)
+    if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
+        print("Error: --mllm-draft-block-size must be a positive integer")
+        sys.exit(1)
+    if mllm_draft_model and args.continuous_batching:
+        print(
+            "Error: --mllm-draft-model is supported only without --continuous-batching"
+        )
+        sys.exit(1)
+    if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
+        print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
         sys.exit(1)
 
     # Configure server security settings
@@ -94,10 +115,18 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
-    default_chat_template_kwargs = args.default_chat_template_kwargs
+    default_chat_template_kwargs = getattr(args, "default_chat_template_kwargs", None)
     if args.reasoning_parser and default_chat_template_kwargs is None:
         default_chat_template_kwargs = {"enable_thinking": False}
     server._default_chat_template_kwargs = default_chat_template_kwargs
+    if args.default_top_k is not None:
+        server._default_top_k = args.default_top_k
+    if args.default_min_p is not None:
+        server._default_min_p = args.default_min_p
+    if args.default_presence_penalty is not None:
+        server._default_presence_penalty = args.default_presence_penalty
+    if args.default_repetition_penalty is not None:
+        server._default_repetition_penalty = args.default_repetition_penalty
     max_audio_upload_mb = getattr(args, "max_audio_upload_mb", 25)
     max_tts_input_chars = getattr(args, "max_tts_input_chars", 4096)
     server._max_audio_upload_bytes = max_audio_upload_mb * 1024 * 1024
@@ -183,22 +212,21 @@ def serve_command(args):
         max_retries=args.download_retries,
         offline=getattr(args, "offline", False),
     )
-    if args.model:
+    if model_arg:
         ensure_model_downloaded(
-            args.model,
+            model_arg,
             config=download_config,
-            is_mllm=is_mllm_model(args.model),
+            is_mllm=is_mllm_model(model_arg),
         )
         if args.lazy_load_model:
-            print(f"Registering model for lazy load: {args.model}")
+            print(f"Registering model for lazy load: {model_arg}")
             print("Model will load on the first request.")
         else:
-            print(f"Loading model: {args.model}")
+            print(f"Loading model: {model_arg}")
     else:
         print(f"Loading models config: {models_config}")
     print(f"Default max tokens: {args.max_tokens}")
     print(f"Max request tokens: {max_request_tokens}")
-    max_kv_size = getattr(args, "max_kv_size", None)
     if max_kv_size is not None:
         print(f"Max KV size: {max_kv_size} (RotatingKVCache)")
 
@@ -305,6 +333,12 @@ def serve_command(args):
                 f"threshold={args.specprefill_threshold}, "
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
+        if mllm_draft_model:
+            print(
+                "MLLM draft model: enabled "
+                f"(draft={mllm_draft_model}, kind={mllm_draft_kind}, "
+                f"block_size={mllm_draft_block_size})"
+            )
 
     if models_config:
         defaults = RegistryServeDefaults(
@@ -326,7 +360,7 @@ def serve_command(args):
     else:
         # Load model with unified server
         load_model(
-            args.model,
+            model_arg,
             use_batching=args.continuous_batching,
             scheduler_config=scheduler_config,
             stream_interval=args.stream_interval if args.continuous_batching else 1,
@@ -342,6 +376,9 @@ def serve_command(args):
             specprefill_threshold=args.specprefill_threshold,
             specprefill_keep_pct=args.specprefill_keep_pct,
             specprefill_draft_model=args.specprefill_draft_model,
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
@@ -1211,6 +1248,27 @@ Examples:
         help="Path to small draft model for SpecPrefill importance scoring. "
         "Must share the same tokenizer as the target model.",
     )
+    # MLLM speculative draft/assistant model
+    serve_parser.add_argument(
+        "--mllm-draft-model",
+        type=str,
+        default=None,
+        help="Path to an mlx-vlm MLLM draft/assistant model. "
+        "For Gemma 4 assistant drafters, use with --mllm-draft-kind mtp.",
+    )
+    serve_parser.add_argument(
+        "--mllm-draft-kind",
+        type=str,
+        default=None,
+        choices=["mtp"],
+        help="mlx-vlm draft kind for --mllm-draft-model.",
+    )
+    serve_parser.add_argument(
+        "--mllm-draft-block-size",
+        type=make_positive_int_arg_parser("--mllm-draft-block-size"),
+        default=None,
+        help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
+    )
     # MCP options
     serve_parser.add_argument(
         "--mcp-config",
@@ -1359,6 +1417,36 @@ Examples:
             "Default chat template kwargs to apply to all requests when request "
             "chat_template_kwargs is omitted or empty; empty request kwargs use "
             'existing server defaults (JSON object, e.g. {"enable_thinking": true})'
+        ),
+    )
+    serve_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Override default top_k for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Override default min_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default presence_penalty for all requests "
+            "(default: use model default)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default repetition_penalty for all requests "
+            "(default: use model default)"
         ),
     )
     # Embedding model option

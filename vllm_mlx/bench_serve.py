@@ -178,6 +178,128 @@ def _first_not_none(*values: Any) -> Any:
     return None
 
 
+def _normalize_tags(tags: Any, *, case_id: str) -> tuple[str, ...]:
+    """Coerce a workload case's ``tags`` field to a tuple of strings.
+
+    Accepts either a single string (treated as a one-element list) or a
+    list. Any other type is rejected with a case-scoped ``ValueError``.
+    """
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, list):
+        raise ValueError(f"{case_id}: tags must be a list or string")
+    return tuple(str(tag) for tag in tags)
+
+
+def _merge_case_checks(
+    default_checks: Any,
+    case_checks: Any,
+    *,
+    case_id: str,
+) -> Optional[dict]:
+    """Merge a case's ``checks`` over the workload defaults.
+
+    Most keys are overridden by the case-level value. The two regex list
+    keys (``required_regex``, ``forbidden_regex``) are list-concatenated
+    with default patterns first and case patterns appended, so
+    case-level patterns extend defaults rather than replace them.
+    Returns ``None`` when neither source contributes any checks.
+
+    Rejects a non-dict ``case_checks`` with a ``ValueError`` named after
+    the case so the operator gets a clear message instead of the
+    ``AttributeError`` that the previous inline code raised on
+    ``case_checks.items()``.
+    """
+    merged: dict = dict(default_checks or {})
+    if not case_checks:
+        return merged or None
+    if not isinstance(case_checks, dict):
+        raise ValueError(f"{case_id}: checks must be an object")
+    for key, value in case_checks.items():
+        if (
+            key in ("required_regex", "forbidden_regex")
+            and isinstance(value, list)
+            and isinstance(merged.get(key), list)
+        ):
+            merged[key] = merged[key] + value
+        else:
+            merged[key] = value
+    return merged or None
+
+
+def _build_workload_case(
+    item: Any,
+    idx: int,
+    *,
+    defaults: dict,
+    workload_path: Path,
+) -> WorkloadCase:
+    """Construct one ``WorkloadCase`` from a raw workload entry.
+
+    Validates the entry shape, loads request defaults from a sibling JSON
+    file when ``request_path`` is provided, merges ``extra_body`` and
+    ``checks`` against the workload defaults, and resolves scalar fields
+    (``max_tokens``, ``enable_thinking``, ``policy_timeout_ms``) via
+    ``_first_not_none`` priority: case-level beats request_path defaults
+    beats workload defaults.
+
+    ``extra_body`` follows a different merge: it composes the
+    ``request_path`` extras (base) with either the case-level
+    ``extra_body`` if present, otherwise the workload-default
+    ``extra_body``. The case-vs-default fallback is a get-with-default,
+    not a three-way merge.
+    """
+    if not isinstance(item, dict):
+        raise ValueError(f"case {idx}: case must be an object")
+    case_id = str(item.get("id") or f"case_{idx + 1}")
+
+    request_path = item.get("request_path")
+    request_defaults: dict = {}
+    if request_path is not None:
+        request_defaults = _load_case_request(
+            str(request_path), workload_path=workload_path, case_id=case_id
+        )
+
+    messages = _require_message_list(
+        item.get("messages", request_defaults.get("messages")),
+        label=case_id,
+    )
+
+    extra_body = item.get("extra_body", defaults.get("extra_body"))
+    request_extra = _request_extra_body(request_defaults)
+    if extra_body:
+        request_extra.update(extra_body)
+    extra_body = request_extra or None
+
+    checks = _merge_case_checks(
+        defaults.get("checks"), item.get("checks"), case_id=case_id
+    )
+
+    return WorkloadCase(
+        case_id=case_id,
+        messages=messages,
+        request_path=str(request_path) if request_path is not None else None,
+        max_tokens=_first_not_none(
+            item.get("max_tokens"),
+            request_defaults.get("max_tokens"),
+            defaults.get("max_tokens"),
+        ),
+        enable_thinking=_first_not_none(
+            item.get("enable_thinking"),
+            request_defaults.get("enable_thinking"),
+            defaults.get("enable_thinking"),
+        ),
+        extra_body=extra_body,
+        policy_timeout_ms=_first_not_none(
+            item.get("policy_timeout_ms"),
+            request_defaults.get("policy_timeout_ms"),
+            defaults.get("policy_timeout_ms"),
+        ),
+        checks=checks,
+        tags=_normalize_tags(item.get("tags", []), case_id=case_id),
+    )
+
+
 def load_workload(path: str | Path) -> Workload:
     """Load a declarative serving benchmark workload.
 
@@ -200,73 +322,10 @@ def load_workload(path: str | Path) -> Workload:
     if not isinstance(defaults, dict):
         raise ValueError("workload defaults must be an object")
 
-    cases: list[WorkloadCase] = []
-    for idx, item in enumerate(raw_cases):
-        if not isinstance(item, dict):
-            raise ValueError(f"case {idx}: case must be an object")
-        case_id = str(item.get("id") or f"case_{idx + 1}")
-        request_path = item.get("request_path")
-        request_defaults: dict = {}
-        if request_path is not None:
-            request_defaults = _load_case_request(
-                str(request_path), workload_path=workload_path, case_id=case_id
-            )
-        messages = _require_message_list(
-            item.get("messages", request_defaults.get("messages")),
-            label=case_id,
-        )
-        extra_body = item.get("extra_body", defaults.get("extra_body"))
-        request_extra = _request_extra_body(request_defaults)
-        if extra_body:
-            request_extra.update(extra_body)
-        extra_body = request_extra or None
-        if extra_body is not None and not isinstance(extra_body, dict):
-            raise ValueError(f"{case_id}: extra_body must be an object")
-        merged_checks = dict(defaults.get("checks") or {})
-        if item.get("checks"):
-            for key, value in item["checks"].items():
-                if (
-                    key in ("required_regex", "forbidden_regex")
-                    and isinstance(value, list)
-                    and isinstance(merged_checks.get(key), list)
-                ):
-                    merged_checks[key] = merged_checks[key] + value
-                else:
-                    merged_checks[key] = value
-        checks = merged_checks or None
-        if checks is not None and not isinstance(checks, dict):
-            raise ValueError(f"{case_id}: checks must be an object")
-        tags = item.get("tags", [])
-        if isinstance(tags, str):
-            tags = [tags]
-        if not isinstance(tags, list):
-            raise ValueError(f"{case_id}: tags must be a list or string")
-
-        cases.append(
-            WorkloadCase(
-                case_id=case_id,
-                messages=messages,
-                request_path=str(request_path) if request_path is not None else None,
-                max_tokens=_first_not_none(
-                    item.get("max_tokens"),
-                    request_defaults.get("max_tokens"),
-                    defaults.get("max_tokens"),
-                ),
-                enable_thinking=_first_not_none(
-                    item.get("enable_thinking"),
-                    request_defaults.get("enable_thinking"),
-                    defaults.get("enable_thinking"),
-                ),
-                extra_body=extra_body,
-                policy_timeout_ms=_first_not_none(
-                    item.get("policy_timeout_ms"),
-                    request_defaults.get("policy_timeout_ms"),
-                    defaults.get("policy_timeout_ms"),
-                ),
-                checks=checks,
-                tags=tuple(str(tag) for tag in tags),
-            )
-        )
+    cases = [
+        _build_workload_case(item, idx, defaults=defaults, workload_path=workload_path)
+        for idx, item in enumerate(raw_cases)
+    ]
 
     return Workload(
         name=str(raw.get("name") or workload_path.stem),
@@ -990,6 +1049,131 @@ def validate_response(
     return (True, "")
 
 
+def _check_finish_reason(allowed: Any, finish_reason: Optional[str]) -> list[str]:
+    """Verify ``finish_reason`` is in the allowed set, if one is configured."""
+    if allowed is None:
+        return []
+    allowed_list = [allowed] if isinstance(allowed, str) else list(allowed)
+    if finish_reason in allowed_list:
+        return []
+    return [f"finish_reason {finish_reason!r} not in allowed set {allowed_list!r}"]
+
+
+def _check_length_bounds(min_chars: Any, max_chars: Any, content: str) -> list[str]:
+    """Apply ``min_chars`` / ``max_chars`` content-length bounds."""
+    issues: list[str] = []
+    if min_chars is not None and len(content) < int(min_chars):
+        issues.append(f"content shorter than min_chars={min_chars}")
+    if max_chars is not None and len(content) > int(max_chars):
+        issues.append(f"content longer than max_chars={max_chars}")
+    return issues
+
+
+def _check_regex_patterns(
+    patterns: Any,
+    content: str,
+    *,
+    kind: str,
+    expect_match: bool,
+) -> list[str]:
+    """Validate that each pattern either matches or does not, per ``expect_match``.
+
+    ``kind`` is the diagnostic name (``"required_regex"`` or
+    ``"forbidden_regex"``) and is reused across the resulting issue
+    strings so operators can grep for the failing check.
+    """
+    issues: list[str] = []
+    for pattern in patterns or []:
+        try:
+            matched = bool(re.search(str(pattern), content, re.MULTILINE))
+        except re.error as exc:
+            issues.append(f"invalid {kind} {pattern!r}: {exc}")
+            continue
+        if expect_match and not matched:
+            issues.append(f"{kind} did not match: {pattern}")
+        elif not expect_match and matched:
+            issues.append(f"{kind} matched: {pattern}")
+    return issues
+
+
+def _check_json_content(should_be_json: Any, content: str) -> list[str]:
+    """Verify ``content`` parses as JSON when ``checks['json']`` is truthy."""
+    if not should_be_json:
+        return []
+    try:
+        json.loads(content)
+    except json.JSONDecodeError as exc:
+        return [f"content is not valid JSON: {exc}"]
+    return []
+
+
+def _check_tool_call_count_and_names(checks: dict, tool_calls: list[dict]) -> list[str]:
+    """Apply ``no_tool_calls`` / ``tool_call_count`` / ``tool_call_names``."""
+    issues: list[str] = []
+    if checks.get("no_tool_calls") and tool_calls:
+        issues.append(f"no_tool_calls: expected 0 tool calls, got {len(tool_calls)}")
+
+    expected_count = checks.get("tool_call_count")
+    if expected_count is not None and len(tool_calls) != int(expected_count):
+        issues.append(
+            f"tool_call_count: expected {expected_count}, got {len(tool_calls)}"
+        )
+
+    expected_names = checks.get("tool_call_names")
+    if expected_names is not None:
+        actual_names = sorted(
+            tc.get("function", {}).get("name", "") for tc in tool_calls
+        )
+        expected_sorted = sorted(str(name) for name in expected_names)
+        if actual_names != expected_sorted:
+            issues.append(
+                f"tool_call_names: expected {expected_sorted!r}, got {actual_names!r}"
+            )
+    return issues
+
+
+def _check_tool_call_args(required_args: Any, tool_calls: list[dict]) -> list[str]:
+    """Validate parsed JSON arguments include the required keys per function.
+
+    For each named function, looks up matching tool calls, parses their
+    ``arguments`` as JSON, and reports issues for: missing tool call,
+    invalid JSON, non-object arguments, or missing required keys.
+    """
+    required_args = required_args or {}
+    if not required_args:
+        return []
+    issues: list[str] = []
+    by_name: dict[str, list[dict]] = {}
+    for tc in tool_calls:
+        name = tc.get("function", {}).get("name", "")
+        by_name.setdefault(name, []).append(tc)
+    for name, required_keys in required_args.items():
+        matches = by_name.get(str(name), [])
+        if not matches:
+            issues.append(f"tool_call_args_required_keys: no tool call named {name!r}")
+            continue
+        for tc in matches:
+            raw_args = tc.get("function", {}).get("arguments", "")
+            try:
+                parsed_args = json.loads(raw_args or "{}")
+            except json.JSONDecodeError as exc:
+                issues.append(
+                    f"tool_call_args_required_keys: {name} arguments invalid JSON: {exc}"
+                )
+                continue
+            if not isinstance(parsed_args, dict):
+                issues.append(
+                    f"tool_call_args_required_keys: {name} arguments not an object"
+                )
+                continue
+            missing = [key for key in required_keys if key not in parsed_args]
+            if missing:
+                issues.append(
+                    f"tool_call_args_required_keys: {name} missing keys {missing!r}"
+                )
+    return issues
+
+
 def validate_quality_checks(
     finish_reason: Optional[str],
     content: str,
@@ -1018,98 +1202,31 @@ def validate_quality_checks(
     checks = checks or {}
     tool_calls = tool_calls or []
 
-    allowed_finish = checks.get("finish_reason")
-    if allowed_finish is not None:
-        allowed = (
-            [allowed_finish]
-            if isinstance(allowed_finish, str)
-            else list(allowed_finish)
+    issues.extend(_check_finish_reason(checks.get("finish_reason"), finish_reason))
+    issues.extend(
+        _check_length_bounds(checks.get("min_chars"), checks.get("max_chars"), content)
+    )
+    issues.extend(
+        _check_regex_patterns(
+            checks.get("required_regex"),
+            content,
+            kind="required_regex",
+            expect_match=True,
         )
-        if finish_reason not in allowed:
-            issues.append(
-                f"finish_reason {finish_reason!r} not in allowed set {allowed!r}"
-            )
-
-    min_chars = checks.get("min_chars")
-    if min_chars is not None and len(content) < int(min_chars):
-        issues.append(f"content shorter than min_chars={min_chars}")
-
-    max_chars = checks.get("max_chars")
-    if max_chars is not None and len(content) > int(max_chars):
-        issues.append(f"content longer than max_chars={max_chars}")
-
-    for pattern in checks.get("required_regex", []) or []:
-        try:
-            if not re.search(str(pattern), content, re.MULTILINE):
-                issues.append(f"required_regex did not match: {pattern}")
-        except re.error as exc:
-            issues.append(f"invalid required_regex {pattern!r}: {exc}")
-
-    for pattern in checks.get("forbidden_regex", []) or []:
-        try:
-            if re.search(str(pattern), content, re.MULTILINE):
-                issues.append(f"forbidden_regex matched: {pattern}")
-        except re.error as exc:
-            issues.append(f"invalid forbidden_regex {pattern!r}: {exc}")
-
-    if checks.get("json"):
-        try:
-            json.loads(content)
-        except json.JSONDecodeError as exc:
-            issues.append(f"content is not valid JSON: {exc}")
-
-    if checks.get("no_tool_calls") and tool_calls:
-        issues.append(f"no_tool_calls: expected 0 tool calls, got {len(tool_calls)}")
-
-    expected_count = checks.get("tool_call_count")
-    if expected_count is not None and len(tool_calls) != int(expected_count):
-        issues.append(
-            f"tool_call_count: expected {expected_count}, got {len(tool_calls)}"
+    )
+    issues.extend(
+        _check_regex_patterns(
+            checks.get("forbidden_regex"),
+            content,
+            kind="forbidden_regex",
+            expect_match=False,
         )
-
-    expected_names = checks.get("tool_call_names")
-    if expected_names is not None:
-        actual_names = sorted(
-            tc.get("function", {}).get("name", "") for tc in tool_calls
-        )
-        expected_sorted = sorted(str(name) for name in expected_names)
-        if actual_names != expected_sorted:
-            issues.append(
-                f"tool_call_names: expected {expected_sorted!r}, got {actual_names!r}"
-            )
-
-    required_args = checks.get("tool_call_args_required_keys") or {}
-    if required_args:
-        by_name: dict[str, list[dict]] = {}
-        for tc in tool_calls:
-            name = tc.get("function", {}).get("name", "")
-            by_name.setdefault(name, []).append(tc)
-        for name, required_keys in required_args.items():
-            matches = by_name.get(str(name), [])
-            if not matches:
-                issues.append(
-                    f"tool_call_args_required_keys: no tool call named {name!r}"
-                )
-                continue
-            for tc in matches:
-                raw_args = tc.get("function", {}).get("arguments", "")
-                try:
-                    parsed_args = json.loads(raw_args or "{}")
-                except json.JSONDecodeError as exc:
-                    issues.append(
-                        f"tool_call_args_required_keys: {name} arguments invalid JSON: {exc}"
-                    )
-                    continue
-                if not isinstance(parsed_args, dict):
-                    issues.append(
-                        f"tool_call_args_required_keys: {name} arguments not an object"
-                    )
-                    continue
-                missing = [key for key in required_keys if key not in parsed_args]
-                if missing:
-                    issues.append(
-                        f"tool_call_args_required_keys: {name} missing keys {missing!r}"
-                    )
+    )
+    issues.extend(_check_json_content(checks.get("json"), content))
+    issues.extend(_check_tool_call_count_and_names(checks, tool_calls))
+    issues.extend(
+        _check_tool_call_args(checks.get("tool_call_args_required_keys"), tool_calls)
+    )
 
     return (not issues, issues)
 
@@ -1229,94 +1346,120 @@ def _summary_or_empty(values: list[float]) -> dict:
     return compute_summary_stats(values) if values else {}
 
 
-async def run_workload_case(
-    client: httpx.AsyncClient,
-    base_url: str,
+def _resolve_max_tokens(case: WorkloadCase, workload: Workload) -> int:
+    """Return the effective ``max_tokens`` for a case, falling back to
+    workload defaults and finally to 256."""
+    return int(case.max_tokens or workload.defaults.get("max_tokens", 256))
+
+
+def _assemble_case_request_kwargs(
+    case: WorkloadCase, workload: Workload, model: str
+) -> dict:
+    """Build the keyword-arguments dict passed to ``stream_chat_completion``
+    for one case, applying max_tokens fallback and converting
+    ``policy_timeout_ms`` to seconds."""
+    return {
+        "messages": case.messages,
+        "model": model,
+        "max_tokens": _resolve_max_tokens(case, workload),
+        "enable_thinking": case.enable_thinking,
+        "extra_body": case.extra_body,
+        "timeout_s": (
+            case.policy_timeout_ms / 1000
+            if case.policy_timeout_ms is not None
+            else None
+        ),
+    }
+
+
+def _empty_completion_result() -> dict:
+    """Zero-valued completion result used when ``stream_chat_completion``
+    raises. The structure matches a real successful response so downstream
+    code can read ``result.get(...)`` without branching on the failure."""
+    return {
+        "ttft_ms": 0.0,
+        "tpot_ms": 0.0,
+        "e2e_latency_ms": 0.0,
+        "gen_tps": 0.0,
+        "prompt_tps": 0.0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "finish_reason": None,
+        "content": "",
+        "tool_calls": [],
+    }
+
+
+async def _fetch_post_run_status(client: httpx.AsyncClient, base_url: str) -> dict:
+    """GET ``/v1/status`` after a case run, swallowing transport errors so
+    a missing or temporarily-unavailable status endpoint does not fail
+    the case record."""
+    try:
+        resp = await client.get(f"{base_url}/v1/status")
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def _compute_within_policy_timeout(
+    timeout_ms: Optional[int], *, error_present: bool, e2e_latency_ms: float
+) -> Optional[bool]:
+    """Resolve the ``policy.within_timeout`` field.
+
+    ``None`` when the case did not configure a policy timeout, ``False``
+    when the request errored (any latency claim would be misleading),
+    and otherwise the latency comparison result.
+    """
+    if timeout_ms is None:
+        return None
+    if error_present:
+        return False
+    return e2e_latency_ms <= timeout_ms
+
+
+def _build_tool_calls_summary(tool_calls: Any) -> Optional[dict]:
+    """Compact summary of streamed tool calls for the case record.
+
+    Returns ``None`` when no tool calls were emitted so consumers can
+    distinguish "feature not exercised" from "feature exercised, zero
+    calls" if that ever matters.
+    """
+    if not tool_calls:
+        return None
+    return {
+        "count": len(tool_calls),
+        "names": sorted(tc.get("function", {}).get("name", "") for tc in tool_calls),
+        "raw": tool_calls,
+    }
+
+
+def _build_workload_record(
     *,
-    workload: Workload,
     case: WorkloadCase,
+    workload: Workload,
     model: str,
     runtime: dict,
     hardware: dict,
     run_id: str,
     timestamp: str,
-    repetition: int = 0,
-    scrape: bool = True,
-    include_content: bool = False,
-    cache_reset: Optional[dict] = None,
+    started_wall: str,
+    repetition: int,
+    result: dict,
+    error: str,
+    quality_ok: bool,
+    quality_issues: list[str],
+    content: str,
+    cache_hits_delta: int,
+    cache_misses_delta: int,
+    tokens_saved_delta: int,
+    status_after: dict,
+    cache_reset: Optional[dict],
+    include_content: bool,
 ) -> dict:
-    """Run one workload case and return a JSON-serializable result."""
-    metrics_before = await scrape_metrics(client, base_url) if scrape else {}
-    started_wall = datetime.now(timezone.utc).isoformat()
-
-    try:
-        result = await stream_chat_completion(
-            client=client,
-            base_url=base_url,
-            messages=case.messages,
-            model=model,
-            max_tokens=int(case.max_tokens or workload.defaults.get("max_tokens", 256)),
-            enable_thinking=case.enable_thinking,
-            extra_body=case.extra_body,
-            timeout_s=(
-                case.policy_timeout_ms / 1000
-                if case.policy_timeout_ms is not None
-                else None
-            ),
-        )
-        error = ""
-    except Exception as exc:
-        result = {
-            "ttft_ms": 0.0,
-            "tpot_ms": 0.0,
-            "e2e_latency_ms": 0.0,
-            "gen_tps": 0.0,
-            "prompt_tps": 0.0,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "finish_reason": None,
-            "content": "",
-            "tool_calls": [],
-        }
-        error = str(exc)
-
-    metrics_after = await scrape_metrics(client, base_url) if scrape else {}
-    status_after: dict = {}
-    try:
-        resp = await client.get(f"{base_url}/v1/status")
-        resp.raise_for_status()
-        status_after = resp.json()
-    except Exception:
-        status_after = {}
-
-    cache_hits_delta = metrics_after.get("cache_hits", 0) - metrics_before.get(
-        "cache_hits", 0
-    )
-    cache_misses_delta = metrics_after.get("cache_misses", 0) - metrics_before.get(
-        "cache_misses", 0
-    )
-    tokens_saved_delta = metrics_after.get("tokens_saved", 0) - metrics_before.get(
-        "tokens_saved", 0
-    )
-
-    content = str(result.get("content") or "")
-    quality_ok, quality_issues = validate_quality_checks(
-        result.get("finish_reason"),
-        content,
-        case.checks,
-        status_code=500 if error else 200,
-        tool_calls=result.get("tool_calls") or [],
-    )
-    if error:
-        quality_issues.append(f"request error: {error}")
-
-    if case.policy_timeout_ms is None:
-        within_policy_timeout = None
-    elif error:
-        within_policy_timeout = False
-    else:
-        within_policy_timeout = result["e2e_latency_ms"] <= case.policy_timeout_ms
-
+    """Assemble the JSON-serializable workload-case record from the raw
+    inputs and the completion result. Pure function: no I/O, deterministic
+    given its arguments."""
     record = {
         "run_id": run_id,
         "timestamp": timestamp,
@@ -1329,9 +1472,7 @@ async def run_workload_case(
         "runtime": runtime,
         "hardware": hardware,
         "request": {
-            "max_tokens": int(
-                case.max_tokens or workload.defaults.get("max_tokens", 256)
-            ),
+            "max_tokens": _resolve_max_tokens(case, workload),
             "request_path": case.request_path,
             "enable_thinking": case.enable_thinking,
             "extra_body": case.extra_body or {},
@@ -1339,7 +1480,11 @@ async def run_workload_case(
         },
         "policy": {
             "timeout_ms": case.policy_timeout_ms,
-            "within_timeout": within_policy_timeout,
+            "within_timeout": _compute_within_policy_timeout(
+                case.policy_timeout_ms,
+                error_present=bool(error),
+                e2e_latency_ms=result["e2e_latency_ms"],
+            ),
         },
         "cache_reset": cache_reset or {"attempted": False},
         "metrics": {
@@ -1362,18 +1507,7 @@ async def run_workload_case(
             "content_chars": len(content),
             "content_preview": content[:240],
         },
-        "tool_calls": (
-            {
-                "count": len(result.get("tool_calls") or []),
-                "names": sorted(
-                    tc.get("function", {}).get("name", "")
-                    for tc in (result.get("tool_calls") or [])
-                ),
-                "raw": result.get("tool_calls") or [],
-            }
-            if result.get("tool_calls")
-            else None
-        ),
+        "tool_calls": _build_tool_calls_summary(result.get("tool_calls") or []),
         "ok": quality_ok,
     }
     if include_content:
@@ -1381,11 +1515,141 @@ async def run_workload_case(
     return record
 
 
+async def run_workload_case(
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    workload: Workload,
+    case: WorkloadCase,
+    model: str,
+    runtime: dict,
+    hardware: dict,
+    run_id: str,
+    timestamp: str,
+    repetition: int = 0,
+    scrape: bool = True,
+    include_content: bool = False,
+    cache_reset: Optional[dict] = None,
+) -> dict:
+    """Run one workload case and return a JSON-serializable result."""
+    metrics_before = await scrape_metrics(client, base_url) if scrape else {}
+    started_wall = datetime.now(timezone.utc).isoformat()
+
+    request_kwargs = _assemble_case_request_kwargs(case, workload, model)
+    try:
+        result = await stream_chat_completion(
+            client=client, base_url=base_url, **request_kwargs
+        )
+        error = ""
+    except Exception as exc:
+        result = _empty_completion_result()
+        error = str(exc)
+
+    metrics_after = await scrape_metrics(client, base_url) if scrape else {}
+    status_after = await _fetch_post_run_status(client, base_url)
+
+    cache_hits_delta = metrics_after.get("cache_hits", 0) - metrics_before.get(
+        "cache_hits", 0
+    )
+    cache_misses_delta = metrics_after.get("cache_misses", 0) - metrics_before.get(
+        "cache_misses", 0
+    )
+    tokens_saved_delta = metrics_after.get("tokens_saved", 0) - metrics_before.get(
+        "tokens_saved", 0
+    )
+
+    content = str(result.get("content") or "")
+    quality_ok, quality_issues = validate_quality_checks(
+        result.get("finish_reason"),
+        content,
+        case.checks,
+        status_code=500 if error else 200,
+        tool_calls=result.get("tool_calls") or [],
+    )
+    if error:
+        quality_issues.append(f"request error: {error}")
+
+    return _build_workload_record(
+        case=case,
+        workload=workload,
+        model=model,
+        runtime=runtime,
+        hardware=hardware,
+        run_id=run_id,
+        timestamp=timestamp,
+        started_wall=started_wall,
+        repetition=repetition,
+        result=result,
+        error=error,
+        quality_ok=quality_ok,
+        quality_issues=quality_issues,
+        content=content,
+        cache_hits_delta=cache_hits_delta,
+        cache_misses_delta=cache_misses_delta,
+        tokens_saved_delta=tokens_saved_delta,
+        status_after=status_after,
+        cache_reset=cache_reset,
+        include_content=include_content,
+    )
+
+
+def _group_results_by_case_id(results: list[dict]) -> dict[str, list[dict]]:
+    """Bucket workload case records by their ``case_id`` field, defaulting
+    a missing ``case_id`` to the empty string so the grouping is stable."""
+    cases: dict[str, list[dict]] = {}
+    for result in results:
+        cases.setdefault(str(result.get("case_id", "")), []).append(result)
+    return cases
+
+
+def _summarize_case(case_results: list[dict]) -> dict:
+    """Build the per-case summary block.
+
+    Mirrors the shape used at the run-level (sample counts, pass/fail
+    rates, policy-timeout outcome, latency / ttft / gen_tps summaries)
+    and adds two case-only fields: ``sample_count`` and ``repetitions``
+    (the sorted set of repetition indices the case was run under), plus
+    ``content_chars`` since content length is more useful per-case than
+    per-run.
+    """
+    quality_failures = [r for r in case_results if not r["quality"].get("ok")]
+    policy_trials = [
+        r for r in case_results if r["policy"].get("within_timeout") is not None
+    ]
+    policy_failures = [
+        r for r in policy_trials if r["policy"].get("within_timeout") is False
+    ]
+    return {
+        "sample_count": len(case_results),
+        "repetitions": sorted(
+            {
+                int(r.get("repetition", 0))
+                for r in case_results
+                if r.get("repetition") is not None
+            }
+        ),
+        "passed": not quality_failures,
+        "failure_count": len(quality_failures),
+        "failure_rate": (
+            round(len(quality_failures) / len(case_results), 4) if case_results else 0.0
+        ),
+        "policy_timeout_passed": (not policy_failures if policy_trials else None),
+        "policy_timeout_failure_count": (
+            len(policy_failures) if policy_trials else None
+        ),
+        "latency_ms": _summary_or_empty(
+            [r["metrics"]["e2e_latency_ms"] for r in case_results]
+        ),
+        "ttft_ms": _summary_or_empty([r["metrics"]["ttft_ms"] for r in case_results]),
+        "gen_tps": _summary_or_empty([r["metrics"]["gen_tps"] for r in case_results]),
+        "content_chars": _summary_or_empty(
+            [r["quality"].get("content_chars", 0) for r in case_results]
+        ),
+    }
+
+
 def summarize_workload_results(results: list[dict]) -> dict:
     """Aggregate workload case records into stable qualification summary stats."""
-    latencies = [r["metrics"]["e2e_latency_ms"] for r in results]
-    ttft = [r["metrics"]["ttft_ms"] for r in results]
-    gen_tps = [r["metrics"]["gen_tps"] for r in results]
     failures = [r for r in results if not r["quality"]["ok"]]
     policy_trials = [
         r for r in results if r["policy"].get("within_timeout") is not None
@@ -1393,54 +1657,12 @@ def summarize_workload_results(results: list[dict]) -> dict:
     policy_failures = [
         r for r in policy_trials if r["policy"].get("within_timeout") is False
     ]
-    cases: dict[str, list[dict]] = {}
-    for result in results:
-        cases.setdefault(str(result.get("case_id", "")), []).append(result)
 
-    case_summaries = {}
-    for case_id, case_results in sorted(cases.items()):
-        case_quality_failures = [r for r in case_results if not r["quality"].get("ok")]
-        case_policy_trials = [
-            r for r in case_results if r["policy"].get("within_timeout") is not None
-        ]
-        case_policy_failures = [
-            r for r in case_policy_trials if r["policy"].get("within_timeout") is False
-        ]
-        case_summaries[case_id] = {
-            "sample_count": len(case_results),
-            "repetitions": sorted(
-                {
-                    int(r.get("repetition", 0))
-                    for r in case_results
-                    if r.get("repetition") is not None
-                }
-            ),
-            "passed": not case_quality_failures,
-            "failure_count": len(case_quality_failures),
-            "failure_rate": (
-                round(len(case_quality_failures) / len(case_results), 4)
-                if case_results
-                else 0.0
-            ),
-            "policy_timeout_passed": (
-                not case_policy_failures if case_policy_trials else None
-            ),
-            "policy_timeout_failure_count": (
-                len(case_policy_failures) if case_policy_trials else None
-            ),
-            "latency_ms": _summary_or_empty(
-                [r["metrics"]["e2e_latency_ms"] for r in case_results]
-            ),
-            "ttft_ms": _summary_or_empty(
-                [r["metrics"]["ttft_ms"] for r in case_results]
-            ),
-            "gen_tps": _summary_or_empty(
-                [r["metrics"]["gen_tps"] for r in case_results]
-            ),
-            "content_chars": _summary_or_empty(
-                [r["quality"].get("content_chars", 0) for r in case_results]
-            ),
-        }
+    cases = _group_results_by_case_id(results)
+    case_summaries = {
+        case_id: _summarize_case(case_results)
+        for case_id, case_results in sorted(cases.items())
+    }
 
     return {
         "case_count": len(results),
@@ -1458,9 +1680,11 @@ def summarize_workload_results(results: list[dict]) -> dict:
         "policy_timeout_failure_count": (
             len(policy_failures) if policy_trials else None
         ),
-        "latency_ms": _summary_or_empty(latencies),
-        "ttft_ms": _summary_or_empty(ttft),
-        "gen_tps": _summary_or_empty(gen_tps),
+        "latency_ms": _summary_or_empty(
+            [r["metrics"]["e2e_latency_ms"] for r in results]
+        ),
+        "ttft_ms": _summary_or_empty([r["metrics"]["ttft_ms"] for r in results]),
+        "gen_tps": _summary_or_empty([r["metrics"]["gen_tps"] for r in results]),
         "case_summaries": case_summaries,
     }
 

@@ -87,6 +87,7 @@ from .api.models import (
     EmbeddingResponse,
     EmbeddingUsage,
     FunctionCall,
+    GenerationMetadata,
     ImageUrl,  # noqa: F401
     MCPExecuteRequest,
     MCPExecuteResponse,
@@ -105,6 +106,7 @@ from .api.models import (
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
+from .api.prompt_canonicalize import canonicalize_system_messages
 from .api.responses_models import (
     ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
@@ -131,7 +133,9 @@ from .api.responses_models import (
     ResponsesUsage,
 )
 from .api.tool_calling import (
+    InvalidResponseFormatOutput,
     StreamingJsonFenceStripper,
+    apply_response_format_or_error,
     build_json_logits_processor,
     build_json_system_prompt,
     convert_tools_for_template,
@@ -151,7 +155,7 @@ from .audio_limits import (
     save_upload_with_limit,
     validate_tts_input_length,
 )
-from .cli_arg_types import make_json_object_arg_parser
+from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -191,6 +195,10 @@ _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 _default_chat_template_kwargs: dict[str, object] | None = None
+_default_top_k: int | None = None  # Set via --default-top-k
+_default_min_p: float | None = None  # Set via --default-min-p
+_default_presence_penalty: float | None = None  # Set via --default-presence-penalty
+_default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
 _metrics_enabled = False
 _max_audio_upload_bytes: int = DEFAULT_MAX_AUDIO_UPLOAD_BYTES
 _max_tts_input_chars: int = DEFAULT_MAX_TTS_INPUT_CHARS
@@ -206,6 +214,10 @@ _lifespan_active: bool = False
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
+_FALLBACK_TOP_K = 0
+_FALLBACK_MIN_P = 0.0
+_FALLBACK_PRESENCE_PENALTY = 0.0
+_FALLBACK_REPETITION_PENALTY = 1.0
 
 
 def _resolve_temperature(request_value: float | None) -> float:
@@ -224,6 +236,42 @@ def _resolve_top_p(request_value: float | None) -> float:
     if _default_top_p is not None:
         return _default_top_p
     return _FALLBACK_TOP_P
+
+
+def _resolve_top_k(request_value: int | None) -> int:
+    """Resolve top_k: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_top_k is not None:
+        return _default_top_k
+    return _FALLBACK_TOP_K
+
+
+def _resolve_min_p(request_value: float | None) -> float:
+    """Resolve min_p: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_min_p is not None:
+        return _default_min_p
+    return _FALLBACK_MIN_P
+
+
+def _resolve_presence_penalty(request_value: float | None) -> float:
+    """Resolve presence_penalty: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_presence_penalty is not None:
+        return _default_presence_penalty
+    return _FALLBACK_PRESENCE_PENALTY
+
+
+def _resolve_repetition_penalty(request_value: float | None) -> float:
+    """Resolve repetition_penalty: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_repetition_penalty is not None:
+        return _default_repetition_penalty
+    return _FALLBACK_REPETITION_PENALTY
 
 
 def _resolve_request_max_tokens(requested_value: int | None) -> int:
@@ -258,6 +306,7 @@ class PreparedChatInvocation:
     chat_kwargs: dict[str, object]
     response_format: object | None
     json_logits_processor: object | None
+    thinking_processor: object | None = None
 
 
 def _prepare_chat_messages(
@@ -305,6 +354,8 @@ def _prepare_chat_messages(
             preserve_native_format=preserve_native,
         )
         messages = _normalize_messages(messages)
+
+    messages = canonicalize_system_messages(messages)
 
     has_media = bool(images or videos or audios)
     if is_mllm and not has_media:
@@ -461,6 +512,18 @@ def _build_thinking_processor(
 
     vocab_size = getattr(tokenizer, "vocab_size", 152064)
 
+    no_final_content_token_limit = _resolve_no_final_content_token_limit()
+    if (
+        no_final_content_token_limit is not None
+        and no_final_content_token_limit >= thinking_token_budget
+    ):
+        logger.warning(
+            "VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT=%d will not fire because "
+            "thinking_token_budget=%d is reached first",
+            no_final_content_token_limit,
+            thinking_token_budget,
+        )
+
     proc = ThinkingAwareLogitsProcessor(
         start_token_ids=start_ids,
         end_token_ids=end_ids,
@@ -468,6 +531,7 @@ def _build_thinking_processor(
         inner=inner,
         vocab_size=vocab_size,
         prompt_has_think_tag=prompt_has_think_tag,
+        no_final_content_token_limit=no_final_content_token_limit,
     )
     logger.info(
         "Thinking processor enabled: budget=%d, start=%s, end=%s",
@@ -476,6 +540,35 @@ def _build_thinking_processor(
         end_ids,
     )
     return proc
+
+
+def _resolve_no_final_content_token_limit() -> int | None:
+    raw = os.environ.get("VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT=%r", raw)
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _generation_metadata(
+    thinking_processor: object | None,
+) -> GenerationMetadata | None:
+    if thinking_processor is None:
+        return None
+    return GenerationMetadata(
+        no_final_content_watchdog_tokens=getattr(
+            thinking_processor, "_no_final_content_token_limit", None
+        ),
+        no_final_content_watchdog_enforced=bool(
+            getattr(thinking_processor, "watchdog_was_enforced", False)
+        ),
+    )
 
 
 class _ThinkingAwareLogitsProcessor:
@@ -592,6 +685,26 @@ class _ThinkingAwareLogitsProcessor:
         return self._inner._disabled
 
 
+def _attach_response_format_logits_processor(
+    chat_kwargs: dict, json_logits_processor: object
+) -> object:
+    """Attach response_format constraints and keep thinking disabled.
+
+    response_format content must be constrained from the first generated token.
+    If the processor is hidden behind thinking-state handling, direct JSON
+    emissions can bypass the constraint and run until max_tokens.
+    """
+
+    chat_kwargs["enable_thinking"] = False
+    if "chat_template_kwargs" in chat_kwargs:
+        chat_kwargs["chat_template_kwargs"] = dict(chat_kwargs["chat_template_kwargs"])
+        chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
+
+    existing = chat_kwargs.get("logits_processors") or []
+    chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+    return json_logits_processor
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -611,18 +724,15 @@ def _prepare_chat_completion_invocation(
         thinking_model=bool(_reasoning_parser),
     )
 
-    rep_penalty = request.repetition_penalty
     chat_kwargs = {
         "max_tokens": effective_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
-        "top_k": request.top_k or 0,
-        "min_p": request.min_p or 0.0,
-        "presence_penalty": request.presence_penalty or 0.0,
-        "repetition_penalty": request.repetition_penalty or 1.0,
+        "top_k": _resolve_top_k(request.top_k),
+        "min_p": _resolve_min_p(request.min_p),
+        "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
+        "repetition_penalty": _resolve_repetition_penalty(request.repetition_penalty),
     }
-    if rep_penalty is not None:
-        chat_kwargs["repetition_penalty"] = rep_penalty
 
     if has_media:
         chat_kwargs["images"] = images if images else None
@@ -647,6 +757,10 @@ def _prepare_chat_completion_invocation(
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking
 
+    mllm_draft = getattr(request, "mllm_draft", None)
+    if mllm_draft is not None:
+        chat_kwargs["mllm_draft"] = mllm_draft
+
     if request.tools and request.tool_choice != "none":
         template_tools = convert_tools_for_template(request.tools)
         template_tools, messages = _apply_forced_tool_choice(
@@ -660,39 +774,16 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["stop"] = merged_stop
 
     if json_logits_processor is not None:
-        # Determine the *effective* thinking state: the request field, the
-        # resolved chat_template_kwargs, or the server default can all inject
-        # ``<think>`` into the rendered prompt independently.
-        ctk = chat_kwargs.get("chat_template_kwargs") or {}
-        effective_thinking = (
-            request.enable_thinking is True or ctk.get("enable_thinking") is True
+        json_logits_processor = _attach_response_format_logits_processor(
+            chat_kwargs, json_logits_processor
         )
-
-        if _reasoning_parser and effective_thinking:
-            # User explicitly requested thinking with constrained decoding
-            # (via top-level enable_thinking or chat_template_kwargs).
-            # Wrap the processor so the enforcer only activates after </think>.
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
-            # Suppress thinking so the model goes straight to JSON.
-            # The template injects an empty <think></think> block and the
-            # enforcer constrains output from the first token onward.
-            # Force both top-level and chat_template_kwargs to prevent the
-            # Jinja template from rendering an open <think> block.
-            request.enable_thinking = False
-            chat_kwargs["enable_thinking"] = False
-            if "chat_template_kwargs" in chat_kwargs:
-                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
     # Only build when thinking is actually enabled for this request -- a CLI
     # default budget should not alter non-thinking requests.
     thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
     enable_thinking = chat_kwargs.get("enable_thinking", True)
+    thinking_proc = None
     if thinking_budget is not None and enable_thinking is not False:
         thinking_proc = _build_thinking_processor(
             engine,
@@ -710,6 +801,7 @@ def _prepare_chat_completion_invocation(
         chat_kwargs=chat_kwargs,
         response_format=response_format,
         json_logits_processor=json_logits_processor,
+        thinking_processor=thinking_proc,
     )
 
 
@@ -733,12 +825,14 @@ def _prepare_anthropic_invocation(
 
     chat_kwargs = {
         "max_tokens": effective_max_tokens,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
-        "top_k": openai_request.top_k or 0,
-        "min_p": openai_request.min_p or 0.0,
-        "presence_penalty": openai_request.presence_penalty or 0.0,
-        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+        "temperature": _resolve_temperature(openai_request.temperature),
+        "top_p": _resolve_top_p(openai_request.top_p),
+        "top_k": _resolve_top_k(openai_request.top_k),
+        "min_p": _resolve_min_p(openai_request.min_p),
+        "presence_penalty": _resolve_presence_penalty(openai_request.presence_penalty),
+        "repetition_penalty": _resolve_repetition_penalty(
+            openai_request.repetition_penalty
+        ),
     }
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         openai_request.chat_template_kwargs
@@ -754,23 +848,9 @@ def _prepare_anthropic_invocation(
         chat_kwargs["tools"] = template_tools
 
     if json_logits_processor is not None:
-        # Same logic as the OpenAI path: check both top-level and
-        # chat_template_kwargs for an explicit thinking request.
-        ctk = chat_kwargs.get("chat_template_kwargs") or {}
-        effective_thinking = (
-            openai_request.enable_thinking is True or ctk.get("enable_thinking") is True
+        json_logits_processor = _attach_response_format_logits_processor(
+            chat_kwargs, json_logits_processor
         )
-
-        if _reasoning_parser and effective_thinking:
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
-            chat_kwargs["enable_thinking"] = False
-            if "chat_template_kwargs" in chat_kwargs:
-                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     return PreparedChatInvocation(
         messages=messages,
@@ -799,6 +879,26 @@ _auth_warning_logged: bool = False
 # Reasoning parser (for models like Qwen3, DeepSeek-R1)
 _reasoning_parser = None  # ReasoningParser instance when enabled
 _reasoning_parser_name: str | None = None
+
+
+def _thinking_disabled(request, chat_kwargs: dict | None = None) -> bool:
+    """Return True iff thinking is explicitly disabled for this request.
+
+    Checks both the request-level ``enable_thinking`` field and the resolved
+    ``chat_template_kwargs`` (which may carry the server-wide default set via
+    ``--default-chat-template-kwargs``). When thinking is disabled the prompt
+    contains no injected ``<think>`` block, so the streaming reasoning parser
+    must not default to implicit-thinking mode and swallow plain content into
+    a ``thinking`` block.
+    """
+    if getattr(request, "enable_thinking", None) is False:
+        return True
+    if chat_kwargs:
+        ctk = chat_kwargs.get("chat_template_kwargs") or {}
+        if ctk.get("enable_thinking") is False:
+            return True
+    return False
+
 
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
@@ -892,6 +992,11 @@ def _list_available_model_names() -> list[str]:
     if _model_manager is not None:
         return _model_manager.registered_model_names
     return [_model_name] if _model_name else []
+
+
+def _response_model_name(request_model: str) -> str:
+    """Return the response model field for single-model or registry mode."""
+    return _model_name or request_model
 
 
 async def _acquire_request_model(request_model: str) -> RequestModelContext:
@@ -1361,7 +1466,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="vllm-mlx API",
     description="OpenAI-compatible API for MLX LLM/MLLM inference on Apple Silicon",
-    version="0.3.0",
+    version="0.4.0rc1",
     lifespan=lifespan,
 )
 
@@ -1679,13 +1784,75 @@ def _parse_tool_calls_with_parser(
                 for tc in result.tool_calls
             ]
             return result.content or "", tool_calls
-        else:
-            # Fallback: specific parser didn't find tool calls,
-            # try generic parser which handles more formats (e.g. Nemotron XML)
-            return parse_tool_calls(output_text, request_dict)
+
+        # Specific parser didn't find any tool calls. Try the generic parser
+        # which handles additional formats (e.g. Nemotron XML).
+        fallback_text, fallback_calls = parse_tool_calls(output_text, request_dict)
+        if fallback_calls:
+            return fallback_text, fallback_calls
+
+        # Neither parser found tool calls. Prefer the specific parser's cleaned
+        # content (which may have stripped truncated tool-call markup left by
+        # max_tokens cut-offs) over the raw model output. Falling back to the
+        # raw text here leaks partial <tool_call>/<function= markup into the
+        # response `content` when generation was cut mid-tool-call.
+        if result.content is not None:
+            return result.content, None
+        return fallback_text, None
     except Exception as e:
         logger.warning("Tool parser error: %s", _sanitize_log_text(e, limit=500))
         return parse_tool_calls(output_text, request_dict)
+
+
+def _apply_response_format_or_raise(
+    text: str,
+    response_format: object,
+    *,
+    ensure_ascii: bool = False,
+) -> str:
+    """Return validated JSON content or fail before returning a success response."""
+    try:
+        text = apply_response_format_or_error(
+            text, response_format, ensure_ascii=ensure_ascii
+        )
+    except InvalidResponseFormatOutput as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_response_format_output",
+                "message": exc.message,
+            },
+        ) from exc
+    return _strip_backslash_before_unicode(text)
+
+
+def _response_format_type(response_format: object | None) -> str | None:
+    if response_format is None:
+        return None
+    if isinstance(response_format, dict):
+        return response_format.get("type")
+    return getattr(response_format, "type", None)
+
+
+def _promote_streaming_response_format_delta(
+    content: str | None,
+    reasoning: str | None,
+    request: ChatCompletionRequest,
+) -> tuple[str | None, str | None]:
+    """Keep response_format JSON on the streaming content channel.
+
+    Some thinking parsers classify direct JSON output as reasoning when the
+    model emits JSON without an explicit reasoning end marker.  For
+    response_format requests, that JSON is the final assistant content.
+    """
+    if content or not reasoning:
+        return content, reasoning
+    if _response_format_type(getattr(request, "response_format", None)) in (
+        "json_object",
+        "json_schema",
+    ):
+        return reasoning, None
+    return content, reasoning
 
 
 def _new_response_item_id(prefix: str) -> str:
@@ -2099,6 +2266,7 @@ def _prepare_responses_request(
         chat_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = canonicalize_system_messages(messages)
 
     chat_kwargs = {
         "max_tokens": chat_request.max_tokens or _default_max_tokens,
@@ -2344,7 +2512,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         previous_text = raw_accumulated_text
         raw_accumulated_text += delta_text
 
-        if _reasoning_parser:
+        if _reasoning_parser and not _thinking_disabled(request, chat_kwargs):
             delta_msg = _reasoning_parser.extract_reasoning_streaming(
                 previous_text, raw_accumulated_text, delta_text
             )
@@ -2843,6 +3011,9 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    mllm_draft_model: str | None = None,
+    mllm_draft_kind: str | None = None,
+    mllm_draft_block_size: int | None = None,
     warm_prompts_path: str | None = None,
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
@@ -2865,6 +3036,9 @@ def load_model(
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        mllm_draft_model: Optional MLLM speculative draft/assistant model path.
+        mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp".
+        mllm_draft_block_size: Optional speculative block size passed to mlx-vlm.
         auto_unload_idle_seconds: Idle time before auto-unloading the main model.
             When non-zero, the main model is managed through lifecycle
             residency instead of being loaded immediately in this function.
@@ -2885,6 +3059,16 @@ def load_model(
         raise ValueError("Max request tokens must be at least 1")
     if max_tokens > max_request_tokens:
         raise ValueError("Default max tokens cannot exceed max request tokens")
+    if mllm_draft_model and not force_mllm:
+        raise ValueError("MLLM draft models require force_mllm/--mllm")
+    if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
+        raise ValueError("MLLM draft block size must be a positive integer")
+    if mllm_draft_model and use_batching:
+        raise ValueError("MLLM draft models are supported only by SimpleEngine")
+    if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):
+        raise ValueError(
+            "MLLM draft models are not supported with lifecycle residency yet"
+        )
 
     if _lifespan_active:
         raise RuntimeError(
@@ -3000,6 +3184,9 @@ def load_model(
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
             max_kv_size=_max_kv,
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
@@ -4425,13 +4612,14 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 "max_tokens": effective_max_tokens,
                 "temperature": _resolve_temperature(request.temperature),
                 "top_p": _resolve_top_p(request.top_p),
-                "top_k": request.top_k or 0,
-                "min_p": request.min_p or 0.0,
-                "presence_penalty": request.presence_penalty or 0.0,
+                "top_k": _resolve_top_k(request.top_k),
+                "min_p": _resolve_min_p(request.min_p),
+                "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
                 "stop": request.stop,
             }
-            if comp_rep_penalty is not None:
-                generate_kwargs["repetition_penalty"] = comp_rep_penalty
+            generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
+                comp_rep_penalty
+            )
             if request.specprefill is not None:
                 generate_kwargs["specprefill"] = request.specprefill
             if request.specprefill_keep_pct is not None:
@@ -4481,7 +4669,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             completion_tokens=total_completion_tokens,
         )
         return CompletionResponse(
-            model=_model_name,
+            model=_response_model_name(request.model),
             choices=choices,
             usage=Usage(
                 prompt_tokens=total_prompt_tokens,
@@ -4640,27 +4828,27 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
             output.text,
             request,
-            allow_reasoning=(getattr(request, "enable_thinking", None) is not False),
+            allow_reasoning=not _thinking_disabled(request, prepared.chat_kwargs),
             engine=engine,
         )
 
         # Process response_format if specified (after reasoning parser cleaned the text)
         if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
-            _, parsed_json, is_valid, error = parse_json_output(
-                json_input, prepared.response_format
-            )
-            if parsed_json is not None:
-                # Return JSON as string
-                parsed_json = _strip_backslash_before_unicode(parsed_json)
-                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
-            if not is_valid:
+            try:
+                cleaned_text = _apply_response_format_or_raise(
+                    json_input,
+                    prepared.response_format,
+                    ensure_ascii=False,
+                )
+            except HTTPException as exc:
                 if prepared.json_logits_processor is not None:
                     logger.error(
-                        "Constrained decoding produced invalid JSON: %s", error
+                        "Constrained decoding produced invalid JSON: %s", exc.detail
                     )
                 else:
-                    logger.warning(f"JSON validation failed: {error}")
+                    logger.warning("JSON validation failed: %s", exc.detail)
+                raise
 
         # Determine finish reason
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
@@ -4671,7 +4859,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             completion_tokens=output.completion_tokens,
         )
         return ChatCompletionResponse(
-            model=_model_name,
+            model=_response_model_name(request.model),
             choices=[
                 ChatCompletionChoice(
                     message=AssistantMessage(
@@ -4689,6 +4877,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
+            generation_metadata=_generation_metadata(prepared.thinking_processor),
         )
     finally:
         if release_on_exit:
@@ -5061,10 +5250,13 @@ async def create_anthropic_message(
             output.text,
             openai_request,
             allow_reasoning=(
-                prepared.json_logits_processor is None
-                or isinstance(
-                    prepared.json_logits_processor,
-                    _ThinkingAwareLogitsProcessor,
+                not _thinking_disabled(openai_request, prepared.chat_kwargs)
+                and (
+                    prepared.json_logits_processor is None
+                    or isinstance(
+                        prepared.json_logits_processor,
+                        _ThinkingAwareLogitsProcessor,
+                    )
                 )
             ),
             engine=engine,
@@ -5072,22 +5264,23 @@ async def create_anthropic_message(
 
         if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
-            _, parsed_json, is_valid, error = parse_json_output(
-                json_input, prepared.response_format
-            )
-            if parsed_json is not None:
-                parsed_json = _strip_backslash_before_unicode(parsed_json)
-                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
-            if not is_valid:
+            try:
+                cleaned_text = _apply_response_format_or_raise(
+                    json_input,
+                    prepared.response_format,
+                    ensure_ascii=False,
+                )
+            except HTTPException as exc:
                 if prepared.json_logits_processor is not None:
                     logger.error(
                         "Constrained decoding produced invalid JSON on Anthropic endpoint: %s",
-                        error,
+                        exc.detail,
                     )
                 else:
                     logger.warning(
-                        "JSON validation failed on Anthropic endpoint: %s", error
+                        "JSON validation failed on Anthropic endpoint: %s", exc.detail
                     )
+                raise
 
         # Clean output text
         final_content = None
@@ -5133,7 +5326,7 @@ async def create_anthropic_message(
         )
 
         anthropic_response = AnthropicResponse(
-            model=_model_name,
+            model=_response_model_name(anthropic_request.model),
             content=content_blocks,
             stop_reason=stop_reason,
             usage=AnthropicUsage(
@@ -5329,7 +5522,7 @@ async def _stream_anthropic_messages(
             "id": msg_id,
             "type": "message",
             "role": "assistant",
-            "model": _model_name,
+            "model": _response_model_name(anthropic_request.model),
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
@@ -5341,8 +5534,10 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    use_reasoning = _reasoning_parser is not None and not chat_kwargs.get(
-        "logits_processors"
+    use_reasoning = (
+        _reasoning_parser is not None
+        and not chat_kwargs.get("logits_processors")
+        and not _thinking_disabled(openai_request, chat_kwargs)
     )
 
     if use_reasoning:
@@ -5580,13 +5775,14 @@ async def stream_completion(
         "max_tokens": max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
-        "top_k": request.top_k or 0,
-        "min_p": request.min_p or 0.0,
-        "presence_penalty": request.presence_penalty or 0.0,
+        "top_k": _resolve_top_k(request.top_k),
+        "min_p": _resolve_min_p(request.min_p),
+        "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
         "stop": request.stop,
     }
-    if repetition_penalty is not None:
-        generate_kwargs["repetition_penalty"] = repetition_penalty
+    generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
+        repetition_penalty
+    )
     if request.specprefill is not None:
         generate_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
@@ -5610,7 +5806,7 @@ async def stream_completion(
                 "id": f"cmpl-{uuid.uuid4().hex[:8]}",
                 "object": "text_completion",
                 "created": int(time.time()),
-                "model": _model_name,
+                "model": _response_model_name(request.model),
                 "choices": [
                     {
                         "index": 0,
@@ -5670,7 +5866,7 @@ async def stream_chat_completion(
     # First chunk with role
     first_chunk = ChatCompletionChunk(
         id=response_id,
-        model=_model_name,
+        model=_response_model_name(request.model),
         choices=[
             ChatCompletionChunkChoice(
                 delta=ChatCompletionChunkDelta(role="assistant"),
@@ -5734,11 +5930,13 @@ async def stream_chat_completion(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            # Use reasoning parser if enabled (skip when enable_thinking=False)
+            # Use reasoning parser if enabled (skip when enable_thinking=False
+            # is set either on the request or via the resolved chat template
+            # kwargs / server default).
             if (
                 _reasoning_parser
                 and delta_text
-                and request.enable_thinking is not False
+                and not _thinking_disabled(request, kwargs)
             ):
                 previous_text = accumulated_text
                 accumulated_text += delta_text
@@ -5752,6 +5950,9 @@ async def stream_chat_completion(
 
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
+                content, reasoning = _promote_streaming_response_format_delta(
+                    content, reasoning, request
+                )
 
                 # Some models (e.g. MiniMax) wrap tool calls in <think>
                 # blocks, so reasoning parser captures tool call XML as
@@ -5792,7 +5993,7 @@ async def stream_chat_completion(
                                 # Still emit reasoning while buffering tool call
                                 chunk = ChatCompletionChunk(
                                     id=response_id,
-                                    model=_model_name,
+                                    model=_response_model_name(request.model),
                                     choices=[
                                         ChatCompletionChunkChoice(
                                             delta=ChatCompletionChunkDelta(
@@ -5819,7 +6020,7 @@ async def stream_chat_completion(
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
-                                model=_model_name,
+                                model=_response_model_name(request.model),
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
@@ -5852,7 +6053,7 @@ async def stream_chat_completion(
 
                 chunk = ChatCompletionChunk(
                     id=response_id,
-                    model=_model_name,
+                    model=_response_model_name(request.model),
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
@@ -5922,7 +6123,7 @@ async def stream_chat_completion(
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
-                                model=_model_name,
+                                model=_response_model_name(request.model),
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
@@ -5954,7 +6155,7 @@ async def stream_chat_completion(
 
                 chunk = ChatCompletionChunk(
                     id=response_id,
-                    model=_model_name,
+                    model=_response_model_name(request.model),
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
@@ -5983,7 +6184,7 @@ async def stream_chat_completion(
             if final_parse_result.tools_called:
                 tool_chunk = ChatCompletionChunk(
                     id=response_id,
-                    model=_model_name,
+                    model=_response_model_name(request.model),
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
@@ -6054,7 +6255,7 @@ async def stream_chat_completion(
         if include_usage:
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
-                model=_model_name,
+                model=_response_model_name(request.model),
                 choices=[],  # Empty choices for usage-only chunk
                 usage=Usage(
                     prompt_tokens=prompt_tokens,
@@ -6173,6 +6374,8 @@ def main():
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
     global _default_temperature, _default_top_p, _default_chat_template_kwargs
+    global _default_top_k, _default_min_p
+    global _default_presence_penalty, _default_repetition_penalty
     global _max_audio_upload_bytes, _max_tts_input_chars
     _api_key = args.api_key
     _default_timeout = args.timeout
@@ -6183,6 +6386,14 @@ def main():
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
     _default_chat_template_kwargs = args.default_chat_template_kwargs
+    if args.default_top_k is not None:
+        _default_top_k = args.default_top_k
+    if args.default_min_p is not None:
+        _default_min_p = args.default_min_p
+    if args.default_presence_penalty is not None:
+        _default_presence_penalty = args.default_presence_penalty
+    if args.default_repetition_penalty is not None:
+        _default_repetition_penalty = args.default_repetition_penalty
     _max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
     _max_tts_input_chars = args.max_tts_input_chars
 
@@ -6251,6 +6462,9 @@ def main():
         max_request_tokens=args.max_request_tokens,
         force_mllm=args.mllm,
         trust_remote_code=args.trust_remote_code,
+        mllm_draft_model=args.mllm_draft_model,
+        mllm_draft_kind=args.mllm_draft_kind,
+        mllm_draft_block_size=args.mllm_draft_block_size,
         auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         lazy_load_model=args.lazy_load_model,
     )
@@ -6315,6 +6529,25 @@ Examples:
         "--continuous-batching",
         action="store_true",
         help="Enable continuous batching for multiple concurrent users",
+    )
+    parser.add_argument(
+        "--mllm-draft-model",
+        type=str,
+        default=None,
+        help="Path to an mlx-vlm MLLM draft/assistant model.",
+    )
+    parser.add_argument(
+        "--mllm-draft-kind",
+        type=str,
+        default=None,
+        choices=["mtp"],
+        help="mlx-vlm draft kind for --mllm-draft-model.",
+    )
+    parser.add_argument(
+        "--mllm-draft-block-size",
+        type=make_positive_int_arg_parser("--mllm-draft-block-size"),
+        default=None,
+        help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
     )
     parser.add_argument(
         "--mcp-config",
@@ -6408,6 +6641,32 @@ Examples:
             "Default chat template kwargs to apply to all requests when request "
             "chat_template_kwargs is omitted or empty; empty request kwargs use "
             'existing server defaults (JSON object, e.g. {"enable_thinking": false})'
+        ),
+    )
+    parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Default top_k for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Default min_p for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help="Default presence_penalty for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Default repetition_penalty for generation when not specified in request"
         ),
     )
     parser.add_argument(

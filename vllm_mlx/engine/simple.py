@@ -7,13 +7,25 @@ performance when serving a single user at a time.
 """
 
 import asyncio
+import contextvars
 import hashlib
 import logging
 import os
 import threading
 import time
+import uuid
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
 from typing import Any
+
+# Re-entrancy guard for SimpleEngine._track_request_stream so that
+# internal fallback paths inside _stream_chat_impl (which call back into
+# self.stream_generate) don't double-count a single external request.
+# contextvars propagates per-asyncio-task, so concurrent requests still
+# each get their own outermost tracking pass.
+_in_tracker: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_simple_engine_in_tracker", default=False
+)
 
 import mlx.core as mx
 
@@ -25,6 +37,7 @@ from .base import (
     cleanup_startup_cancellation,
     run_blocking_startup_work,
 )
+from .chat_template_safety import normalize_messages_for_chat_template
 from ..mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
@@ -126,6 +139,9 @@ class SimpleEngine(BaseEngine):
         specprefill_keep_pct: float = 0.3,
         specprefill_draft_model: str | None = None,
         max_kv_size: int = 0,
+        mllm_draft_model: str | None = None,
+        mllm_draft_kind: str | None = None,
+        mllm_draft_block_size: int | None = None,
     ):
         """
         Initialize the simple engine.
@@ -143,6 +159,9 @@ class SimpleEngine(BaseEngine):
             specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
             specprefill_draft_model: Path to small draft model for importance scoring
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            mllm_draft_model: Optional MLLM speculative draft/assistant model path
+            mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp"
+            mllm_draft_block_size: Optional speculative block size for mlx-vlm
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -153,11 +172,27 @@ class SimpleEngine(BaseEngine):
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
 
+        # Request stats (parity with BatchedEngine for /v1/status monitoring).
+        # Without these, monitoring sees zero traffic for SimpleEngine-backed
+        # servers (e.g. Gemma 4 31B with --mllm-draft-model + MTP).
+        self._total_requests_processed: int = 0
+        self._total_prompt_tokens: int = 0
+        self._total_completion_tokens: int = 0
+        self._num_running: int = 0
+        # Rolling window of (completion_tokens, duration_s) for tps computation.
+        self._recent_completions: deque = deque(maxlen=20)
+        # Live per-request state, mirroring BatchedEngine's "requests" list
+        # in /v1/status (request_id, phase, ttft_s, tokens_per_second, ...).
+        self._active_requests: dict[str, dict[str, Any]] = {}
+
         # SpecPrefill config
         self._specprefill_enabled = specprefill_enabled
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
         self._specprefill_draft_model_path = specprefill_draft_model
+        self._mllm_draft_model_path = mllm_draft_model
+        self._mllm_draft_kind = mllm_draft_kind
+        self._mllm_draft_block_size = mllm_draft_block_size
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -175,10 +210,25 @@ class SimpleEngine(BaseEngine):
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
 
-        # System prompt KV cache (reduces repeated prefill across requests)
-        self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
-        self._system_kv_hash = None  # Hash of system prefix text
-        self._system_kv_token_count = 0  # Tokens in cached prefix
+        # System prompt KV cache (reduces repeated prefill across requests).
+        # OrderedDict acts as an LRU keyed by system-prefix hash so that the
+        # main agent and any sub-agents with different toolsets can coexist
+        # without thrashing a single snapshot slot.
+        # Value is (snapshot_list, system_token_count).
+        self._system_kv_capacity = max(
+            1, int(os.environ.get("VLLM_MLX_SYSTEM_KV_SLOTS", "4"))
+        )
+        self._system_kv_cache: "OrderedDict[str, tuple[list, int]]" = OrderedDict()
+        # Cache-effectiveness counters. Incremented only from inside the
+        # serialized worker (single writer) so plain ``+=`` is safe; reads
+        # from ``get_stats`` may be slightly stale, which is fine for
+        # metrics.
+        self._system_kv_cache_stats = {
+            "hits": 0,
+            "misses": 0,
+            "stores": 0,
+            "evictions": 0,
+        }
         # True only when the model's prompt cache is composed entirely of
         # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
         # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
@@ -218,6 +268,9 @@ class SimpleEngine(BaseEngine):
                 trust_remote_code=self._trust_remote_code,
                 enable_cache=self._enable_cache,
                 max_kv_size=self._max_kv_size,
+                draft_model=self._mllm_draft_model_path,
+                draft_kind=self._mllm_draft_kind,
+                draft_block_size=self._mllm_draft_block_size,
             )
         else:
             from ..models.llm import MLXLanguageModel
@@ -293,7 +346,7 @@ class SimpleEngine(BaseEngine):
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
             # on the slower mlx_vlm multimodal path.
-            if self._is_mllm:
+            if self._is_mllm and self._should_route_text_through_text_model():
                 try:
                     from ..text_model_from_vlm import build_text_model
 
@@ -310,6 +363,46 @@ class SimpleEngine(BaseEngine):
                             self._text_tokenizer.eos_token_id = (
                                 self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
                             )
+
+                        # Probe the derived TextModel's prompt cache for snapshot-safety
+                        # (same gate stream_chat uses for the pure-LLM path).
+                        # _stream_generate_text only enters the system-KV cache branch
+                        # when this flag is True, so sliding-window text models won't
+                        # desynchronize on restore.
+                        #
+                        # Probe args must match the runtime constructor in
+                        # _stream_generate_text (max_kv_size=self._max_kv_size or None).
+                        # Under bounded-KV serving (max_kv_size > 0) make_prompt_cache
+                        # returns RotatingKVCache for models without a custom
+                        # make_cache; probing with default args would mis-classify that
+                        # path as snapshot-safe.
+                        try:
+                            from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+                            probe_cache = make_prompt_cache(
+                                self._text_model, max_kv_size=self._max_kv_size or None
+                            )
+                            self._supports_system_kv_cache = bool(probe_cache) and all(
+                                isinstance(c, KVCache) for c in probe_cache
+                            )
+                            if not self._supports_system_kv_cache:
+                                cache_types = sorted(
+                                    {type(c).__name__ for c in probe_cache}
+                                )
+                                logger.info(
+                                    "System KV cache snapshot disabled for MLLM "
+                                    "text routing: TextModel returned non-KVCache "
+                                    "entries (%s); _stream_generate_text will use "
+                                    "the uncached path",
+                                    cache_types,
+                                )
+                        except Exception as e:
+                            logger.debug(
+                                "MLLM TextModel KV cache support probe failed "
+                                "(%s); disabling snapshot path",
+                                e,
+                            )
+                            self._supports_system_kv_cache = False
 
                         has_mtp = (
                             hasattr(self._text_model, "mtp")
@@ -380,11 +473,17 @@ class SimpleEngine(BaseEngine):
         self._text_tokenizer = None
         self._draft_model = None
         self._loaded = False
-        self._system_kv_snapshot = None
-        self._system_kv_hash = None
-        self._system_kv_token_count = 0
+        self._system_kv_cache.clear()
+        for k in self._system_kv_cache_stats:
+            self._system_kv_cache_stats[k] = 0
         self._supports_system_kv_cache = False
         logger.info("SimpleEngine stopped")
+
+    def _should_route_text_through_text_model(
+        self, *, mllm_draft_requested: bool = False
+    ) -> bool:
+        """Return whether text-only MLLM requests may use mlx_lm TextModel."""
+        return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
 
     async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
         """Run a blocking MLX operation under the generation lock.
@@ -481,7 +580,117 @@ class SimpleEngine(BaseEngine):
             finished=True,
         )
 
+    async def _track_request_stream(
+        self,
+        source_gen: AsyncIterator[GenerationOutput],
+        *,
+        max_tokens: int = 0,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Yield-through wrapper that records per-request live state and
+        final ``prompt_tokens``/``completion_tokens`` counters.
+
+        Mirrors the fields BatchedEngine emits per running request
+        (``request_id``, ``phase``, ``elapsed_s``, ``ttft_s``,
+        ``tokens_per_second``, ``progress``, ...) so dashboards built
+        against ``/v1/status`` show individual in-flight requests for
+        SimpleEngine-backed services as well (Gemma 4 31B + MTP, etc.).
+
+        Re-entrant calls (e.g. the cache-fallback path inside
+        ``_stream_chat_impl`` that delegates to ``self.stream_generate``)
+        are detected via the ``_in_tracker`` context variable and pass
+        through without a second tracking entry, so each external
+        request is counted exactly once.
+
+        Note: we deliberately use ``set(True)``/``set(False)`` rather
+        than ``set(token)``/``reset(token)``. FastAPI/uvicorn finalize
+        streaming generators from a different async context than the
+        one that created them; ``ContextVar.reset(token)`` raises
+        ``ValueError`` in that case ("Token was created in a different
+        Context"), which surfaces as a terminal-frame streaming error.
+        ``set(False)`` works in any context and the contextvar is only
+        consumed inside this method, so there is no value to preserve.
+        """
+        if _in_tracker.get():
+            async for output in source_gen:
+                yield output
+            return
+        _in_tracker.set(True)
+        request_id = str(uuid.uuid4())
+        start = time.time()
+        ttft_s: float | None = None
+        last_p = 0
+        last_c = 0
+        entry: dict[str, Any] = {
+            "request_id": request_id,
+            "status": "running",
+            "phase": "prefill",
+            "elapsed_s": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "max_tokens": max_tokens,
+            "progress": 0.0,
+            "tokens_per_second": 0.0,
+            "ttft_s": None,
+            "cache_hit_type": None,
+            "cached_tokens": 0,
+        }
+        self._active_requests[request_id] = entry
+        self._num_running += 1
+        try:
+            async for output in source_gen:
+                now = time.time()
+                if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+                    last_p = output.prompt_tokens
+                    entry["prompt_tokens"] = last_p
+                if hasattr(output, "completion_tokens") and output.completion_tokens:
+                    if ttft_s is None:
+                        ttft_s = now - start
+                        entry["ttft_s"] = round(ttft_s, 3)
+                        entry["phase"] = "generation"
+                    last_c = output.completion_tokens
+                    entry["completion_tokens"] = last_c
+                entry["elapsed_s"] = round(now - start, 2)
+                if max_tokens > 0:
+                    entry["progress"] = round(min(1.0, last_c / max_tokens), 3)
+                if ttft_s is not None and last_c > 0:
+                    gen_elapsed = max(1e-3, (now - start) - ttft_s)
+                    entry["tokens_per_second"] = round(last_c / gen_elapsed, 1)
+                yield output
+        finally:
+            self._active_requests.pop(request_id, None)
+            self._num_running = max(0, self._num_running - 1)
+            if last_c > 0:
+                duration = time.time() - start
+                self._total_requests_processed += 1
+                self._total_prompt_tokens += last_p
+                self._total_completion_tokens += last_c
+                self._recent_completions.append((last_c, duration))
+            _in_tracker.set(False)
+
     async def stream_generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop: list[str] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Public stream-generate wrapper with request stats tracking."""
+        async for output in self._track_request_stream(
+            self._stream_generate_impl(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            ),
+            max_tokens=max_tokens,
+        ):
+            yield output
+
+    async def _stream_generate_impl(
         self,
         prompt: str,
         max_tokens: int = 256,
@@ -669,6 +878,8 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=final_output.prompt_tokens,
                 completion_tokens=final_output.completion_tokens,
                 finish_reason=final_output.finish_reason,
+                mtp_drafts=final_output.mtp_drafts,
+                mtp_accepted=final_output.mtp_accepted,
             )
 
         # mlx-lm non-streaming chat with tools can stall indefinitely on some
@@ -704,6 +915,8 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
+                mtp_drafts=getattr(output, "mtp_drafts", 0),
+                mtp_accepted=getattr(output, "mtp_accepted", 0),
             )
         else:
             output = await self._run_blocking_serialized(
@@ -747,6 +960,33 @@ class SimpleEngine(BaseEngine):
         videos: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
+        """Public stream-chat wrapper with request stats tracking."""
+        async for output in self._track_request_stream(
+            self._stream_chat_impl(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                images=images,
+                videos=videos,
+                **kwargs,
+            ),
+            max_tokens=max_tokens,
+        ):
+            yield output
+
+    async def _stream_chat_impl(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
         """
         Stream chat completion token by token.
 
@@ -767,6 +1007,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -775,6 +1016,9 @@ class SimpleEngine(BaseEngine):
         if (
             self._is_mllm
             and self._text_model is not None
+            and self._should_route_text_through_text_model(
+                mllm_draft_requested=mllm_draft_requested
+            )
             and not has_media_content(messages)
         ):
             has_mtp = (
@@ -794,6 +1038,14 @@ class SimpleEngine(BaseEngine):
                 yield chunk
             return
 
+        def mllm_call_kwargs() -> dict:
+            local_kwargs = dict(kwargs)
+            if chat_template_kwargs:
+                local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+            if mllm_draft_requested:
+                local_kwargs["mllm_draft"] = True
+            return local_kwargs
+
         # Build prompt using tokenizer
         if self._is_mllm:
             if self._text_model is not None:
@@ -808,9 +1060,7 @@ class SimpleEngine(BaseEngine):
             # current thread. Routing through to_thread can break mlx_vlm stream
             # ownership on some models (Stream(gpu, N) mismatch).
             if self._text_model is None and not has_media_content(messages):
-                local_kwargs = dict(kwargs)
-                if chat_template_kwargs:
-                    local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+                local_kwargs = mllm_call_kwargs()
 
                 async with self._generation_lock:
                     _bind_worker_generation_streams()
@@ -834,6 +1084,8 @@ class SimpleEngine(BaseEngine):
                             completion_tokens=token_count,
                             finished=finished,
                             finish_reason=chunk.finish_reason if finished else None,
+                            mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                            mtp_accepted=getattr(chunk, "mtp_accepted", 0),
                         )
 
                         if finished:
@@ -842,9 +1094,7 @@ class SimpleEngine(BaseEngine):
 
             # Run stream_chat in thread pool since it's synchronous
             def run_stream():
-                local_kwargs = dict(kwargs)
-                if chat_template_kwargs:
-                    local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+                local_kwargs = mllm_call_kwargs()
                 return list(
                     self._model.stream_chat(
                         messages=messages,
@@ -871,6 +1121,8 @@ class SimpleEngine(BaseEngine):
                     completion_tokens=token_count,
                     finished=finished,
                     finish_reason=chunk.finish_reason if finished else None,
+                    mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                    mtp_accepted=getattr(chunk, "mtp_accepted", 0),
                 )
 
                 if finished:
@@ -893,15 +1145,16 @@ class SimpleEngine(BaseEngine):
                 template_kwargs.update(chat_template_kwargs)
             if template_tools:
                 template_kwargs["tools"] = template_tools
+            safe_messages = normalize_messages_for_chat_template(messages)
 
             try:
-                prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
             except TypeError:
                 # Some templates don't support all kwargs
                 for key in ["tools", "enable_thinking", *chat_template_kwargs.keys()]:
                     if key in template_kwargs:
                         del template_kwargs[key]
-                prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
@@ -922,9 +1175,9 @@ class SimpleEngine(BaseEngine):
         system_hash = None
         kv_cache_eligible = False
         # Snapshot reference captured at gate time so a concurrent MISS that
-        # reassigns ``self._system_kv_snapshot`` between the gate and the
-        # restore (which runs later inside ``_run_blocking_serialized``)
-        # can't desynchronize the restored KV from the hash that decided HIT.
+        # mutates ``self._system_kv_cache`` between the gate and the restore
+        # (which runs later inside ``_run_blocking_serialized``) can't
+        # desynchronize the restored KV from the hash that decided HIT.
         hit_snapshot: Any = None
 
         # Decode-control gate.
@@ -1082,19 +1335,16 @@ class SimpleEngine(BaseEngine):
                         suffix_tokens = full_tokens_list[system_token_count:]
                         kv_cache_eligible = True
                         # Read the snapshot reference once. If we promote to
-                        # HIT, ``hit_snapshot`` is the exact list the hash
-                        # check just validated against. A later concurrent
-                        # MISS that reassigns ``self._system_kv_snapshot``
-                        # before our serialized worker restores it cannot
-                        # alias what we captured here.
-                        candidate_snapshot = self._system_kv_snapshot
-                        if (
-                            system_hash == self._system_kv_hash
-                            and candidate_snapshot is not None
-                            and system_token_count == self._system_kv_token_count
-                        ):
+                        # HIT, ``hit_snapshot`` is the exact list the dict
+                        # lookup just returned. A later concurrent MISS that
+                        # mutates ``self._system_kv_cache`` before our
+                        # serialized worker restores it cannot alias what we
+                        # captured here — dict.get is atomic under the GIL
+                        # and returns a reference to an immutable tuple.
+                        candidate = self._system_kv_cache.get(system_hash)
+                        if candidate is not None and system_token_count == candidate[1]:
                             cache_hit = True
-                            hit_snapshot = candidate_snapshot
+                            hit_snapshot = candidate[0]
                             logger.info(
                                 "System KV cache HIT (stream_chat): reusing %d "
                                 "tokens, prefilling %d new (hash=%s)",
@@ -1142,12 +1392,16 @@ class SimpleEngine(BaseEngine):
                 if cache_hit:
                     bc = make_prompt_cache(model)
                     # Restore from the closure-local reference captured at the
-                    # gate, never from ``self._system_kv_snapshot`` directly:
-                    # a concurrent MISS could have replaced the instance
-                    # attribute with a snapshot for a different system prefix
-                    # between the gate check and this point.
+                    # gate, never from ``self._system_kv_cache`` directly:
+                    # a concurrent MISS could have evicted the entry between
+                    # the gate check and this point.
                     for i, saved_state in enumerate(hit_snapshot):
                         bc[i].state = saved_state
+                    # Bump LRU position. Safe to mutate here because the
+                    # worker is serialized under ``_generation_lock``.
+                    if system_hash in self._system_kv_cache:
+                        self._system_kv_cache.move_to_end(system_hash)
+                    self._system_kv_cache_stats["hits"] += 1
                 else:
                     bc = make_prompt_cache(model)
                     sys_arr = mx.array(system_tokens)
@@ -1170,9 +1424,26 @@ class SimpleEngine(BaseEngine):
 
                     snapshot = [c.state for c in bc]
                     mx.eval([s for pair in snapshot for s in pair])
-                    self._system_kv_snapshot = snapshot
-                    self._system_kv_hash = system_hash
-                    self._system_kv_token_count = system_token_count
+                    self._system_kv_cache[system_hash] = (snapshot, system_token_count)
+                    self._system_kv_cache.move_to_end(system_hash)
+                    evicted_count = 0
+                    while len(self._system_kv_cache) > self._system_kv_capacity:
+                        evicted_hash, _ = self._system_kv_cache.popitem(last=False)
+                        self._system_kv_cache_stats["evictions"] += 1
+                        evicted_count += 1
+                        logger.info(
+                            "System KV cache EVICTED (stream_chat): hash=%s "
+                            "(capacity=%d)",
+                            evicted_hash,
+                            self._system_kv_capacity,
+                        )
+                    if evicted_count:
+                        # Eviction dropped MLX array refs; reclaim Metal heap.
+                        # Skip on the common non-eviction path to avoid
+                        # flushing the Metal allocator's reuse pool.
+                        mx.clear_cache()
+                    self._system_kv_cache_stats["misses"] += 1
+                    self._system_kv_cache_stats["stores"] += 1
                     try:
                         cache_mb = sum(c.nbytes for c in bc) / 1e6
                     except Exception:
@@ -1261,6 +1532,9 @@ class SimpleEngine(BaseEngine):
                         pass
 
             if cache_path_failed_before_first_token:
+                # Internal fallback to the public stream_generate. The
+                # ``_in_tracker`` context flag prevents double counting
+                # in _track_request_stream.
                 async for output in self.stream_generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
@@ -1271,7 +1545,8 @@ class SimpleEngine(BaseEngine):
                     yield output
             return
 
-        # Fallback: no system prefix detected -> original uncached path
+        # Fallback: no system prefix detected -> original uncached path.
+        # Re-entrancy guard in _track_request_stream keeps stats single-counted.
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -1531,17 +1806,18 @@ class SimpleEngine(BaseEngine):
         template_kwargs.update(chat_template_kwargs)
         if tools:
             template_kwargs["tools"] = tools
+        safe_messages = normalize_messages_for_chat_template(messages)
 
         try:
             full_prompt = self._text_tokenizer.apply_chat_template(
-                messages, **template_kwargs
+                safe_messages, **template_kwargs
             )
         except TypeError:
             # Template doesn't accept tools= or enable_thinking=
             template_kwargs.pop("tools", None)
             template_kwargs.pop("enable_thinking", None)
             full_prompt = self._text_tokenizer.apply_chat_template(
-                messages, **template_kwargs
+                safe_messages, **template_kwargs
             )
 
         sampler = make_sampler(
@@ -1574,7 +1850,14 @@ class SimpleEngine(BaseEngine):
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
 
-        if has_system and self._text_model is not None:
+        # Snapshot-safety: only enter the system-KV cache branch when start()'s
+        # probe verified the derived TextModel returns KVCache entries (and not
+        # RotatingKVCache, which aliases buffers mutated in place).
+        if (
+            has_system
+            and self._text_model is not None
+            and self._supports_system_kv_cache
+        ):
             # Find system prefix boundary in full prompt text.
             # ChatML format: system section ends where first non-system message begins.
             # Works with tools (rendered inside system section by Qwen templates).
@@ -1616,10 +1899,10 @@ class SimpleEngine(BaseEngine):
                     system_tokens = system_tokens_list
                     suffix_tokens = full_tokens_list[system_token_count:]
 
+                    hit_candidate = self._system_kv_cache.get(system_hash)
                     if (
-                        system_hash == self._system_kv_hash
-                        and self._system_kv_snapshot is not None
-                        and system_token_count == self._system_kv_token_count
+                        hit_candidate is not None
+                        and system_token_count == hit_candidate[1]
                     ):
                         # Cache HIT — restore KV state into fresh backbone cache
                         def make_cache_with_snapshot(
@@ -1643,9 +1926,13 @@ class SimpleEngine(BaseEngine):
                             await self._run_blocking_serialized(
                                 make_cache_with_snapshot,
                                 self._text_model,
-                                self._system_kv_snapshot,
+                                hit_candidate[0],
                             )
                         )
+                        # Bump LRU position now that we know we'll use it.
+                        if system_hash in self._system_kv_cache:
+                            self._system_kv_cache.move_to_end(system_hash)
+                        self._system_kv_cache_stats["hits"] += 1
                         cache_hit = True
 
                         logger.info(
@@ -1821,9 +2108,25 @@ class SimpleEngine(BaseEngine):
                 snapshot = [c.state for c in mc]
                 mx.eval([s for pair in snapshot for s in pair])
 
-                self._system_kv_snapshot = snapshot
-                self._system_kv_hash = system_hash
-                self._system_kv_token_count = system_token_count
+                self._system_kv_cache[system_hash] = (snapshot, system_token_count)
+                self._system_kv_cache.move_to_end(system_hash)
+                evicted_count = 0
+                while len(self._system_kv_cache) > self._system_kv_capacity:
+                    evicted_hash, _ = self._system_kv_cache.popitem(last=False)
+                    self._system_kv_cache_stats["evictions"] += 1
+                    evicted_count += 1
+                    logger.info(
+                        "System KV cache EVICTED: hash=%s (capacity=%d)",
+                        evicted_hash,
+                        self._system_kv_capacity,
+                    )
+                if evicted_count:
+                    # Eviction dropped MLX array refs; reclaim Metal heap.
+                    # Skip on the common non-eviction path to avoid flushing
+                    # the Metal allocator's reuse pool.
+                    mx.clear_cache()
+                self._system_kv_cache_stats["misses"] += 1
+                self._system_kv_cache_stats["stores"] += 1
 
                 backbone_cache = mc
                 prompt_to_send = mx.array(suffix_tokens)
@@ -2168,13 +2471,67 @@ class SimpleEngine(BaseEngine):
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
+        # Compute rolling generation_tps from recent completions.
+        gen_tps = 0.0
+        if self._recent_completions:
+            total_tok = sum(c for c, _ in self._recent_completions)
+            total_sec = sum(s for _, s in self._recent_completions)
+            if total_sec > 0:
+                gen_tps = total_tok / total_sec
+        # Snapshot active requests with live elapsed_s refreshed at read time.
+        now = time.time()
+        requests_snapshot: list[dict[str, Any]] = []
+        for entry in self._active_requests.values():
+            snap = dict(entry)
+            # entry stores last-known elapsed at last yield; refresh here so
+            # the snapshot is meaningful even between yields.
+            requests_snapshot.append(snap)
         stats = {
             "engine_type": "simple",
             "model_name": self._model_name,
-            "uptime_seconds": time.time() - self._created_at,
+            "uptime_seconds": now - self._created_at,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
+            "running": self._loaded,
+            "num_running": self._num_running,
+            "num_waiting": 0,
+            "num_requests_processed": self._total_requests_processed,
+            "total_prompt_tokens": self._total_prompt_tokens,
+            "total_completion_tokens": self._total_completion_tokens,
+            "batch_generator": {
+                "generation_tps": gen_tps,
+                "prompt_tps": 0.0,
+            },
+            "requests": requests_snapshot,
         }
+
+        # MLLM prefix cache stats, remapped to the shape BatchedEngine emits
+        # under "memory_aware_cache" so monitoring dashboards (which key off
+        # current_memory_mb / max_memory_mb / memory_utilization /
+        # entry_count) render cache utilization for SimpleEngine services.
+        if self._is_mllm and self._model is not None:
+            try:
+                raw_cache = self._model.get_cache_stats()
+            except Exception:
+                raw_cache = None
+            if raw_cache and raw_cache.get("enabled"):
+                current_mb = float(raw_cache.get("memory_used_mb", 0) or 0)
+                max_mb = float(raw_cache.get("max_memory_mb", 0) or 0)
+                stats["memory_aware_cache"] = {
+                    "hits": raw_cache.get("hits", 0),
+                    "misses": raw_cache.get("misses", 0),
+                    "hit_rate": raw_cache.get("hit_rate", 0.0),
+                    "evictions": raw_cache.get("evictions", 0),
+                    "tokens_saved": raw_cache.get("tokens_saved", 0),
+                    "current_memory_mb": round(current_mb, 2),
+                    "max_memory_mb": round(max_mb, 2),
+                    "memory_utilization": (
+                        round(current_mb / max_mb, 4) if max_mb > 0 else 0.0
+                    ),
+                    "entry_count": raw_cache.get(
+                        "cache_entries", raw_cache.get("entries", 0)
+                    ),
+                }
 
         # SpecPrefill stats
         if self._draft_model is not None:
@@ -2185,18 +2542,36 @@ class SimpleEngine(BaseEngine):
                 "keep_pct": self._specprefill_keep_pct,
             }
 
-        # System KV cache stats
-        if self._system_kv_snapshot is not None:
-            cache_bytes = 0
-            for entry in self._system_kv_snapshot:
-                if isinstance(entry, tuple) and len(entry) == 2:
-                    cache_bytes += entry[0].nbytes + entry[1].nbytes
-                elif isinstance(entry, list):
-                    cache_bytes += sum(a.nbytes for a in entry if a is not None)
+        # System KV cache stats (LRU over multiple system prefixes)
+        if self._system_kv_cache:
+            slots = []
+            total_bytes = 0
+            for slot_hash, (snapshot, tokens) in self._system_kv_cache.items():
+                slot_bytes = 0
+                for entry in snapshot:
+                    if isinstance(entry, tuple) and len(entry) == 2:
+                        slot_bytes += entry[0].nbytes + entry[1].nbytes
+                    elif isinstance(entry, list):
+                        slot_bytes += sum(a.nbytes for a in entry if a is not None)
+                total_bytes += slot_bytes
+                slots.append(
+                    {
+                        "hash": slot_hash,
+                        "tokens": tokens,
+                        "memory_mb": round(slot_bytes / 1e6, 1),
+                    }
+                )
+            counters = dict(self._system_kv_cache_stats)
+            denom = counters["hits"] + counters["misses"]
+            counters["hit_ratio"] = (
+                round(counters["hits"] / denom, 3) if denom > 0 else None
+            )
             stats["system_kv_cache"] = {
-                "tokens": self._system_kv_token_count,
-                "hash": self._system_kv_hash,
-                "memory_mb": round(cache_bytes / 1e6, 1),
+                "capacity": self._system_kv_capacity,
+                "in_use": len(self._system_kv_cache),
+                "total_memory_mb": round(total_bytes / 1e6, 1),
+                "slots": slots,
+                "counters": counters,
             }
 
         # Include Metal memory stats
@@ -2213,14 +2588,55 @@ class SimpleEngine(BaseEngine):
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
-        """Get cache statistics (for MLLM models)."""
+        """Get cache statistics for the system-prompt KV LRU plus, when the
+        model is multimodal, the MLLM's own cache stats.
+        """
+        result: dict[str, Any] = {}
+        if self._supports_system_kv_cache:
+            counters = dict(self._system_kv_cache_stats)
+            denom = counters["hits"] + counters["misses"]
+            counters["hit_ratio"] = (
+                round(counters["hits"] / denom, 3) if denom > 0 else None
+            )
+            result["system_kv_cache"] = {
+                "capacity": self._system_kv_capacity,
+                "in_use": len(self._system_kv_cache),
+                "counters": counters,
+            }
         if self._is_mllm and self._model is not None:
-            return self._model.get_cache_stats()
-        return None
+            result["mllm_cache"] = self._model.get_cache_stats()
+        return result or None
 
     def clear_runtime_caches(self) -> dict[str, Any] | None:
-        """Clear engine-managed runtime caches."""
+        """Clear engine-managed runtime caches.
+
+        Includes the multi-slot system-prompt KV LRU — each retained snapshot
+        is multi-GB on the Metal heap, so DELETE /v1/cache must drop them or
+        the operator's reset is silently incomplete. Counters reset alongside
+        so /v1/cache/stats reflects the cleared state immediately.
+
+        OrderedDict ops are atomic under the GIL: a concurrent worker that has
+        already captured a tuple reference from .get() finishes safely against
+        its own copy; any new request after this call hits MISS and repopulates
+        from scratch. No need to acquire _generation_lock for the clear itself.
+        """
+        result: dict[str, Any] = {}
+
+        dropped = len(self._system_kv_cache)
+        if dropped or any(self._system_kv_cache_stats.values()):
+            self._system_kv_cache.clear()
+            for k in self._system_kv_cache_stats:
+                self._system_kv_cache_stats[k] = 0
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass
+            result["system_kv_cache"] = {"dropped_entries": dropped}
+
         if self._is_mllm and self._model is not None:
             self._model.clear_cache()
-            return {"model_cache": True}
-        return None
+            result["model_cache"] = True
+
+        return result or None

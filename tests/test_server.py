@@ -170,6 +170,46 @@ class TestChatCompletionRequest:
             )
 
 
+class TestPromptCanonicalization:
+    """Test OpenAI-path system prompt canonicalization."""
+
+    def test_prepare_chat_completion_canonicalizes_system_prompt(self):
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            _prepare_chat_completion_invocation,
+        )
+
+        engine = SimpleNamespace(is_mllm=False, preserve_native_tool_format=False)
+        system_text = (
+            "You are a coding assistant.\n"
+            "x-anthropic-billing-header: account=abc; cch=rotating-hash\n"
+            "Follow the repository instructions."
+        )
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                Message(role="system", content=system_text),
+                Message(
+                    role="user",
+                    content="x-anthropic-billing-header: keep user content",
+                ),
+            ],
+        )
+
+        prepared = _prepare_chat_completion_invocation(engine, request, 128)
+
+        expected_system_text = "\n".join(
+            ["You are a coding assistant.", "Follow the repository instructions."]
+        )
+        assert prepared.messages[0]["content"] == expected_system_text
+        assert (
+            prepared.messages[1]["content"]
+            == "x-anthropic-billing-header: keep user content"
+        )
+        assert request.messages[0].content == system_text
+
+
 class TestCompletionRequest:
     """Test CompletionRequest model."""
 
@@ -191,6 +231,64 @@ class TestCompletionRequest:
             CompletionRequest(
                 model="test-model", prompt="Once upon a time", max_tokens=0
             )
+
+
+class TestSamplingDefaults:
+    """Test server-wide sampling default resolution."""
+
+    def test_extended_sampling_defaults_resolve_from_server_globals(self):
+        from vllm_mlx import server
+
+        old_values = (
+            server._default_top_k,
+            server._default_min_p,
+            server._default_presence_penalty,
+            server._default_repetition_penalty,
+        )
+        try:
+            server._default_top_k = 20
+            server._default_min_p = 0.05
+            server._default_presence_penalty = 1.5
+            server._default_repetition_penalty = 1.1
+
+            assert server._resolve_top_k(None) == 20
+            assert server._resolve_min_p(None) == 0.05
+            assert server._resolve_presence_penalty(None) == 1.5
+            assert server._resolve_repetition_penalty(None) == 1.1
+        finally:
+            (
+                server._default_top_k,
+                server._default_min_p,
+                server._default_presence_penalty,
+                server._default_repetition_penalty,
+            ) = old_values
+
+    def test_request_values_override_extended_sampling_defaults(self):
+        from vllm_mlx import server
+
+        old_values = (
+            server._default_top_k,
+            server._default_min_p,
+            server._default_presence_penalty,
+            server._default_repetition_penalty,
+        )
+        try:
+            server._default_top_k = 20
+            server._default_min_p = 0.05
+            server._default_presence_penalty = 1.5
+            server._default_repetition_penalty = 1.1
+
+            assert server._resolve_top_k(0) == 0
+            assert server._resolve_min_p(0.0) == 0.0
+            assert server._resolve_presence_penalty(0.0) == 0.0
+            assert server._resolve_repetition_penalty(1.0) == 1.0
+        finally:
+            (
+                server._default_top_k,
+                server._default_min_p,
+                server._default_presence_penalty,
+                server._default_repetition_penalty,
+            ) = old_values
 
 
 class TestAnthropicRequest:
@@ -2138,6 +2236,83 @@ class TestStreamChatCompletion:
         assert "reasoning" not in payloads[1]["choices"][0]["delta"]
         assert payloads[2]["choices"][0]["delta"]["content"] == "final answer"
         assert payloads[2]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.anyio
+    async def test_response_format_stream_promotes_reasoning_json_to_content(
+        self, monkeypatch
+    ):
+        """response_format JSON belongs on the streaming content channel."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="",
+                    new_text='{"ok": true}',
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=4,
+                    completion_tokens=3,
+                )
+
+        class ReasoningOnlyParser:
+            def reset_state(self):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                return DeltaMessage(reasoning=delta_text)
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", ReasoningOnlyParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="return json")],
+            stream=True,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ok",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                    },
+                },
+            },
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        delta = payloads[1]["choices"][0]["delta"]
+        assert json.loads(delta["content"]) == {"ok": True}
+        assert "reasoning_content" not in delta
+        assert payloads[1]["choices"][0]["finish_reason"] == "stop"
 
     @pytest.mark.anyio
     async def test_streaming_chat_no_stream_thread_error_after_residency_preload(

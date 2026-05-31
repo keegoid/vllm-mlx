@@ -9,11 +9,12 @@ These models define the request and response schemas for:
 - MCP (Model Context Protocol) integration
 """
 
+import re
 import time
 import uuid
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field, model_serializer
+from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -88,6 +89,9 @@ class Message(BaseModel):
 # =============================================================================
 
 
+_OPENAI_FUNCTION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 class FunctionCall(BaseModel):
     """A function call with name and arguments."""
 
@@ -108,6 +112,15 @@ class ToolDefinition(BaseModel):
 
     type: str = "function"
     function: dict
+
+    @model_validator(mode="after")
+    def _validate_openai_function_name(self):
+        if self.type != "function":
+            return self
+        name = self.function.get("name")
+        if not isinstance(name, str) or not _OPENAI_FUNCTION_NAME_RE.fullmatch(name):
+            raise ValueError("function.name must match ^[A-Za-z0-9_-]{1,64}$")
+        return self
 
 
 # =============================================================================
@@ -188,6 +201,10 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
+    # MLLM assistant-drafter path: opt in to using a configured drafter.
+    # Text-only requests also use this flag to leave the default TextModel route
+    # and run through the MLLM path where the drafter can participate.
+    mllm_draft: bool | None = None
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
     thinking_token_budget: int | None = Field(default=None, gt=0)
@@ -239,6 +256,13 @@ class Usage(BaseModel):
     total_tokens: int = 0
 
 
+class GenerationMetadata(BaseModel):
+    """Optional generation diagnostics emitted for feature-bearing requests."""
+
+    no_final_content_watchdog_tokens: int | None = None
+    no_final_content_watchdog_enforced: bool = False
+
+
 class ChatCompletionResponse(BaseModel):
     """Response for chat completion."""
 
@@ -248,6 +272,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[ChatCompletionChoice]
     usage: Usage = Field(default_factory=Usage)
+    generation_metadata: GenerationMetadata | None = None
 
 
 # =============================================================================
