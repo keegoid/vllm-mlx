@@ -186,6 +186,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # OpenAI-compatible token bias map: token id string -> bias value
+    logit_bias: dict[str, float] | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
@@ -199,6 +201,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # SpecPrefill: per-request evenly spaced backbone percentage.
+    specprefill_backbone_pct: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
     # MLLM assistant-drafter path: opt in to using a configured drafter.
@@ -301,6 +305,8 @@ class CompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # SpecPrefill: per-request evenly spaced backbone percentage.
+    specprefill_backbone_pct: float | None = None
 
 
 class CompletionChoice(BaseModel):

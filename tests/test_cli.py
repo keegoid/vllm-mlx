@@ -19,6 +19,8 @@ def _serve_args(**overrides):
         "download_retries": 0,
         "download_timeout": 1,
         "embedding_model": None,
+        "embedding_max_length": None,
+        "embedding_overflow_policy": "truncate",
         "enable_auto_tool_choice": False,
         "enable_metrics": False,
         "enable_mtp": False,
@@ -45,6 +47,9 @@ def _serve_args(**overrides):
         "prefill_batch_size": 8,
         "prefill_step_size": 512,
         "prefix_cache_size": 100,
+        "prefix_trie_cache": False,
+        "prefix_trie_cache_size": 32,
+        "prefix_trie_cache_memory_mb": None,
         "rate_limit": 0,
         "reasoning_parser": None,
         "served_model_name": None,
@@ -67,10 +72,16 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     from vllm_mlx import cli, server
     from vllm_mlx.utils import download
 
+    loaded = {}
+
     monkeypatch.setattr(
         download, "ensure_model_downloaded", lambda *args, **kwargs: "local-test-model"
     )
-    monkeypatch.setattr(server, "load_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "load_model",
+        lambda *args, **kwargs: loaded.update({"args": args, "kwargs": kwargs}),
+    )
     monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
 
     for attr in (
@@ -91,6 +102,7 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
             default_min_p=0.0,
             default_presence_penalty=0.0,
             default_repetition_penalty=1.0,
+            specprefill_backbone_pct=0.25,
         )
     )
 
@@ -100,3 +112,4 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     assert server._default_min_p == 0.0
     assert server._default_presence_penalty == 0.0
     assert server._default_repetition_penalty == 1.0
+    assert loaded["kwargs"]["specprefill_backbone_pct"] == 0.25

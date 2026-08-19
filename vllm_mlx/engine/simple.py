@@ -16,6 +16,8 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from typing import Any
 
 # Re-entrancy guard for SimpleEngine._track_request_stream so that
@@ -33,19 +35,34 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from .base import (
     BaseEngine,
+    EngineBusy,
+    EngineStopped,
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
-from ..mlx_streams import bind_generation_streams
+from ..mlx_streams import (
+    bind_generation_streams,
+    restore_generation_streams,
+    snapshot_generation_streams,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _bind_worker_generation_streams() -> None:
+def _bind_worker_generation_streams(stream: object | None = None) -> object:
     """Rebind mlx generation streams inside the current worker thread."""
-    bind_generation_streams()
+    return bind_generation_streams(stream=stream)
+
+
+def _join_executors(executors: list[ThreadPoolExecutor]) -> None:
+    """Wait for detached generation workers to finish, on a worker thread."""
+    for executor in executors:
+        try:
+            executor.shutdown(wait=True)
+        except Exception:  # pragma: no cover - shutdown is already idempotent
+            logger.debug("Draining a previous generation worker failed", exc_info=True)
 
 
 def _seed_logits_processors(
@@ -113,6 +130,11 @@ def _processors_retired(processors: list[Any] | None) -> bool:
     )
 
 
+# Sentinel for "the generation iterator is exhausted", pulled across the
+# worker-thread boundary where StopIteration cannot travel.
+_STREAM_DONE = object()
+
+
 class _SpecPrefillCancelled(Exception):
     """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
 
@@ -137,11 +159,15 @@ class SimpleEngine(BaseEngine):
         specprefill_enabled: bool = False,
         specprefill_threshold: int = 8192,
         specprefill_keep_pct: float = 0.3,
+        specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
         max_kv_size: int = 0,
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
+        prefix_trie_cache: bool = False,
+        prefix_trie_cache_size: int = 32,
+        prefix_trie_cache_memory_mb: int | None = None,
     ):
         """
         Initialize the simple engine.
@@ -157,11 +183,16 @@ class SimpleEngine(BaseEngine):
             specprefill_enabled: Enable SpecPrefill (attention-based sparse prefill)
             specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
             specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
+            specprefill_backbone_pct: Fraction of chunks to reserve for evenly
+                spaced coverage (default: 0.0)
             specprefill_draft_model: Path to small draft model for importance scoring
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
             mllm_draft_model: Optional MLLM speculative draft/assistant model path
             mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp"
             mllm_draft_block_size: Optional speculative block size for mlx-vlm
+            prefix_trie_cache: Enable mlx-lm LRUPromptCache on pure-LLM stream_chat
+            prefix_trie_cache_size: Maximum prompt-cache trie entries
+            prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -189,10 +220,24 @@ class SimpleEngine(BaseEngine):
         self._specprefill_enabled = specprefill_enabled
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
         self._mllm_draft_model_path = mllm_draft_model
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
+        self._prefix_trie_cache_enabled = prefix_trie_cache
+        self._prefix_trie_cache_size = max(1, prefix_trie_cache_size)
+        self._prefix_trie_cache_memory_mb = prefix_trie_cache_memory_mb
+        self._prefix_trie_cache = None
+        self._prefix_trie_cache_lock = threading.Lock()
+        self._prefix_trie_cache_stats = {
+            "lookups": 0,
+            "hits": 0,
+            "misses": 0,
+            "inserts": 0,
+            "skips": 0,
+            "tokens_saved": 0,
+        }
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -209,6 +254,26 @@ class SimpleEngine(BaseEngine):
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
+        # NOTE: "fail_fast" rejects whenever the lock is held. That used to be
+        # rare for streaming requests by accident — generation ran on the event
+        # loop, so a second request could not reach this check until the first
+        # had finished. Now that generation has its own thread the loop stays
+        # responsive and genuinely concurrent requests reach it, so operators
+        # who prefer queuing to 503s want
+        # VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=wait.
+        self._generation_lock_admission = (
+            os.environ.get("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "fail_fast")
+            .strip()
+            .lower()
+        )
+        if self._generation_lock_admission not in {"fail_fast", "wait"}:
+            logger.warning(
+                "Invalid VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=%r; using fail_fast",
+                self._generation_lock_admission,
+            )
+            self._generation_lock_admission = "fail_fast"
+        self._generation_waiters = 0
+        self._generation_busy_rejections = 0
 
         # System prompt KV cache (reduces repeated prefill across requests).
         # OrderedDict acts as an LRU keyed by system-prefix hash so that the
@@ -229,12 +294,315 @@ class SimpleEngine(BaseEngine):
             "stores": 0,
             "evictions": 0,
         }
-        # True only when the model's prompt cache is composed entirely of
-        # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
-        # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
-        # aliases buffers ``update_and_fetch`` mutates in place — snapshot
-        # restore would silently desynchronize. Probed once in ``start()``.
+        # True only when the model's prompt cache can be snapshotted and
+        # restored for the manual system-prefix cache branch. Plain KV caches
+        # and hybrid ``ArraysCache`` entries are safe when their state
+        # containers are copied at snapshot/restore boundaries. Sliding-window
+        # cache classes such as ``RotatingKVCache`` remain disabled because
+        # their extra cursor metadata is not captured by ``.state`` alone.
         self._supports_system_kv_cache: bool = False
+
+        # Every MLX generation call runs on this one thread; see
+        # ``_generation_worker``.
+        self._generation_executor: ThreadPoolExecutor | None = None
+        self._generation_streams_bound: bool = False
+        self._pre_bind_generation_streams: dict[str, object] | None = None
+        self._worker_generation_stream: object | None = None
+        # Set by ``stop()``. In-flight pumps check it between chunks so a stop
+        # costs one token rather than one whole generation.
+        self._stopping: bool = False
+        # Workers ``stop()`` left running because MLX was still busy. The next
+        # worker thread joins them before it touches MLX itself.
+        self._draining_executors: list[ThreadPoolExecutor] = []
+        # Number of routes currently driving the generation worker, and an
+        # event that is set exactly while that number is zero. ``stop()`` waits
+        # on it briefly so generators close on the thread that owns them.
+        self._generation_users: int = 0
+        self._generation_idle: asyncio.Event = asyncio.Event()
+        self._generation_idle.set()
+        # ``on_cancel`` hooks of in-flight blocking work, so ``stop()`` can use
+        # the abort paths those routes already implement.
+        self._generation_abort_hooks: dict[str, Any] = {}
+
+    # How long ``stop()`` gives in-flight MLX work to wind down before it
+    # detaches the worker and returns. Streaming routes check the stopping flag
+    # between chunks, so they land well inside this; a monolithic
+    # ``mlx_lm.generate()`` call cannot be interrupted at all and is left to
+    # finish in the background rather than stalling the event loop.
+    STOP_DRAIN_TIMEOUT_S: float = 5.0
+
+    def _generation_worker(self) -> ThreadPoolExecutor:
+        """Return the single thread that owns every MLX generation call.
+
+        MLX streams exist only in the thread that created them, and a pending
+        array carries the stream its primitives were built on. Anything that
+        outlives one request therefore cannot be handed to a different thread:
+        the prompt cache built during load or a previous turn blows up in
+        ``mx.eval([c.state for c in prompt_cache])`` with "There is no
+        Stream(gpu, N) in current thread".
+
+        ``asyncio.to_thread`` spreads work over the default executor, so this
+        failed on every request once a cache survived a turn. Rebinding the
+        module-level generation streams cannot help — the cache already holds
+        the old stream, so the rebind changes a global nothing reads. Pinning
+        the work is the fix, and it is what BatchedEngine already does
+        (``engine_core.py``: ``ThreadPoolExecutor(max_workers=1)``).
+        """
+        if self._generation_executor is None:
+            self._generation_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="simple-generate"
+            )
+            self._generation_streams_bound = False
+            # The stream belongs to the thread that made it, so it cannot
+            # outlive the worker: a fresh one must allocate its own.
+            self._worker_generation_stream = None
+            # A previous stop() detached its worker while MLX was still busy so
+            # the event loop stayed responsive. Two threads must never be inside
+            # Metal at once, so the new thread's first job is to wait the old
+            # ones out. max_workers=1 keeps that ordered ahead of the model
+            # load, and the wait lands on the worker, never on the loop.
+            draining, self._draining_executors = self._draining_executors, []
+            if draining:
+                self._generation_executor.submit(_join_executors, draining)
+        return self._generation_executor
+
+    @asynccontextmanager
+    async def _generation_worker_in_use(self):
+        """Mark the generation worker busy for the length of one route.
+
+        ``stop()`` waits on the idle event so a route gets to close its MLX
+        generator on the thread that owns it, instead of having the executor
+        pulled out from under it.
+        """
+        self._generation_users += 1
+        self._generation_idle.clear()
+        try:
+            yield
+        finally:
+            self._generation_users -= 1
+            if self._generation_users <= 0:
+                self._generation_users = 0
+                # Hand the module-level generation streams back. They are
+                # process-global, so leaving them on the worker's stream makes
+                # every other thread's read fail, not just this engine's.
+                if self._pre_bind_generation_streams is not None:
+                    restore_generation_streams(self._pre_bind_generation_streams)
+                    self._generation_streams_bound = False
+                self._generation_idle.set()
+                self._retire_detached_workers()
+
+    def _retire_detached_workers(self) -> None:
+        """Shut down workers ``stop()`` detached, once nothing is using them.
+
+        ``stop()`` leaves a busy worker running and alive: the route still
+        holding it has an MLX generator to close, and that close belongs on the
+        thread that owns it. Ownership therefore passes to the last user, which
+        is here. The executors stay listed so the next worker thread can still
+        join them before it touches MLX itself.
+        """
+        for executor in self._draining_executors:
+            executor.shutdown(wait=False)
+
+    def _generation_worker_is_live(
+        self, worker: ThreadPoolExecutor | None, *, ignore_stopping: bool = False
+    ) -> bool:
+        """True while ``worker`` is still this engine's usable generation thread."""
+        if worker is None:
+            return False
+        if worker is self._generation_executor:
+            return ignore_stopping or not self._stopping
+        # Detached by stop() but not yet retired: still good for the cleanup its
+        # own route owes, never for new generation.
+        return ignore_stopping and worker in self._draining_executors
+
+    async def _submit_to_generation_worker(
+        self,
+        worker: ThreadPoolExecutor | None,
+        fn,
+        /,
+        *args,
+        during_shutdown: bool = False,
+    ):
+        """Run ``fn`` on the pinned thread, reporting shutdown as EngineStopped.
+
+        Routes capture the worker once and then submit per chunk, so a stop can
+        land between two submits. Without this the next submit surfaces
+        ``RuntimeError("cannot schedule new futures after shutdown")`` in the
+        middle of a client response.
+
+        ``during_shutdown`` is for the cleanup a stopping route still owes its
+        generator: the stopping flag alone must not block it, because ``stop()``
+        is waiting for exactly that work before it tears the thread down.
+        """
+        blocked_by_stop = self._stopping and not during_shutdown
+        if blocked_by_stop or not self._generation_worker_is_live(
+            worker, ignore_stopping=during_shutdown
+        ):
+            raise EngineStopped("SimpleEngine stopped while generation was in flight")
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(worker, fn, *args)
+        except RuntimeError as exc:
+            if "cannot schedule new futures" in str(exc):
+                raise EngineStopped(
+                    "SimpleEngine stopped while generation was in flight"
+                ) from exc
+            raise
+
+    @staticmethod
+    def _clone_cache_state(value: Any) -> Any:
+        """Copy cache state containers without duplicating immutable MLX arrays."""
+        if isinstance(value, tuple):
+            return tuple(SimpleEngine._clone_cache_state(v) for v in value)
+        if isinstance(value, list):
+            return [SimpleEngine._clone_cache_state(v) for v in value]
+        return value
+
+    @classmethod
+    def _snapshot_prompt_cache(cls, prompt_cache: list[Any]) -> list[Any]:
+        """Capture cache states without aliasing mutable state containers."""
+        return [cls._clone_cache_state(c.state) for c in prompt_cache]
+
+    @classmethod
+    def _restore_prompt_cache(
+        cls, prompt_cache: list[Any], snapshot: list[Any]
+    ) -> None:
+        """Restore cache states without letting decode mutate the saved snapshot."""
+        for i, saved_state in enumerate(snapshot):
+            prompt_cache[i].state = cls._clone_cache_state(saved_state)
+
+    @staticmethod
+    def _iter_cache_state_arrays(value: Any):
+        if isinstance(value, (tuple, list)):
+            for item in value:
+                yield from SimpleEngine._iter_cache_state_arrays(item)
+        elif hasattr(value, "shape") and hasattr(value, "dtype"):
+            yield value
+
+    @classmethod
+    def _eval_cache_snapshot(cls, snapshot: list[Any]) -> None:
+        arrays = list(cls._iter_cache_state_arrays(snapshot))
+        if arrays:
+            mx.eval(arrays)
+
+    @staticmethod
+    def _cache_class_is_system_snapshot_safe(cache_entry: Any) -> bool:
+        try:
+            from mlx_lm.models.cache import ArraysCache, KVCache
+
+            return isinstance(cache_entry, (KVCache, ArraysCache))
+        except Exception:
+            cache_type = type(cache_entry).__name__
+            return cache_type in {"KVCache", "ArraysCache"}
+
+    @classmethod
+    def _probe_system_kv_cache_support(cls, model: Any, route: str) -> bool:
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+
+            probe_cache = make_prompt_cache(model)
+            supported = bool(probe_cache) and all(
+                cls._cache_class_is_system_snapshot_safe(c) for c in probe_cache
+            )
+            if not supported:
+                cache_types = sorted({type(c).__name__ for c in probe_cache})
+                logger.info(
+                    "System KV cache snapshot disabled (%s): model returned "
+                    "unsupported cache entries (%s); requests will use the "
+                    "uncached path",
+                    route,
+                    cache_types,
+                )
+            return supported
+        except Exception as e:
+            logger.debug(
+                "System KV cache support probe failed (%s, %s); "
+                "disabling snapshot path",
+                route,
+                e,
+            )
+            return False
+
+    def _ensure_prefix_trie_cache(self) -> Any | None:
+        """Return the optional mlx-lm prompt trie cache, creating it lazily."""
+        if not self._prefix_trie_cache_enabled:
+            return None
+        if self._is_mllm:
+            self._prefix_trie_cache_stats["skips"] += 1
+            return None
+        with self._prefix_trie_cache_lock:
+            if self._prefix_trie_cache is None:
+                from mlx_lm.models.cache import LRUPromptCache
+
+                max_bytes = (
+                    self._prefix_trie_cache_memory_mb * 1024 * 1024
+                    if self._prefix_trie_cache_memory_mb is not None
+                    else 1 << 63
+                )
+                self._prefix_trie_cache = LRUPromptCache(
+                    max_size=self._prefix_trie_cache_size,
+                    max_bytes=max_bytes,
+                )
+        return self._prefix_trie_cache
+
+    def _fetch_prefix_trie_cache(
+        self, model: Any, tokens: list[int]
+    ) -> tuple[Any | None, list[int] | None, int]:
+        """Fetch a nearest prompt-cache trie entry for a full prompt token list."""
+        prefix_trie = self._ensure_prefix_trie_cache()
+        if prefix_trie is None:
+            return None, None, 0
+
+        self._prefix_trie_cache_stats["lookups"] += 1
+        try:
+            with self._prefix_trie_cache_lock:
+                trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(model, tokens)
+            if trie_cache is None or trie_rest is None or len(trie_rest) >= len(tokens):
+                self._prefix_trie_cache_stats["misses"] += 1
+                return None, None, 0
+
+            if len(trie_rest) == 0:
+                from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
+
+                if not can_trim_prompt_cache(trie_cache):
+                    raise ValueError("exact prefix-trie cache hit is not trimmable")
+                trim_prompt_cache(trie_cache, 1)
+                trie_rest = [tokens[-1]]
+
+            tokens_saved = len(tokens) - len(trie_rest)
+            self._prefix_trie_cache_stats["hits"] += 1
+            self._prefix_trie_cache_stats["tokens_saved"] += tokens_saved
+            return trie_cache, list(trie_rest), tokens_saved
+        except Exception as e:
+            self._prefix_trie_cache_stats["skips"] += 1
+            logger.debug("Prefix trie cache lookup skipped after failure (%s)", e)
+            return None, None, 0
+
+    def _insert_prefix_trie_cache(
+        self, model: Any, cache_key: list[int], prompt_cache: Any
+    ) -> None:
+        """Insert a completed prompt cache into the optional prompt trie cache."""
+        prefix_trie = self._ensure_prefix_trie_cache()
+        if prefix_trie is None or not cache_key:
+            return
+        try:
+            with self._prefix_trie_cache_lock:
+                prefix_trie.insert_cache(model, cache_key, prompt_cache)
+            self._prefix_trie_cache_stats["inserts"] += 1
+        except Exception as e:
+            self._prefix_trie_cache_stats["skips"] += 1
+            logger.debug("Prefix trie cache insert skipped (%s)", e)
+
+    def _prefix_trie_cache_snapshot(self) -> tuple[int, int]:
+        """Return current prompt-trie entry and byte counts."""
+        with self._prefix_trie_cache_lock:
+            entries = (
+                len(self._prefix_trie_cache)
+                if self._prefix_trie_cache is not None
+                else 0
+            )
+            nbytes = self._prefix_trie_cache.nbytes if self._prefix_trie_cache else 0
+        return entries, nbytes
 
     @property
     def model_name(self) -> str:
@@ -254,6 +622,69 @@ class SimpleEngine(BaseEngine):
         if self._is_mllm:
             return getattr(self._model, "processor", None)
         return self._model.tokenizer
+
+    def _generation_lock_holder_summary(self) -> str:
+        if not self._active_requests:
+            return "none"
+
+        holders = []
+        now = time.time()
+        for request_id, info in self._active_requests.items():
+            elapsed_s = info.get("elapsed_s")
+            started_at = info.get("started_at")
+            if started_at is not None:
+                elapsed_s = round(now - started_at, 1)
+            kind = info.get("kind", "unknown")
+            status = info.get("status", "unknown")
+            holders.append(
+                f"{request_id}:{status}:{kind}:"
+                f"prompt={info.get('prompt_tokens', 0)}:"
+                f"completion={info.get('completion_tokens', 0)}:"
+                f"elapsed_s={elapsed_s if elapsed_s is not None else 'unknown'}"
+            )
+        return ",".join(holders)
+
+    @asynccontextmanager
+    async def _acquire_generation_slot(self, request_id: str):
+        """Admission control for SimpleEngine's serialized MLX route."""
+        if (
+            self._generation_lock_admission == "fail_fast"
+            and self._generation_lock.locked()
+        ):
+            self._generation_busy_rejections += 1
+            raise EngineBusy(
+                "SimpleEngine serialized route is busy; "
+                f"request_id={request_id}; "
+                f"active={self._generation_lock_holder_summary()}; "
+                f"waiters={self._generation_waiters}; "
+                "retry later"
+            )
+
+        self._generation_waiters += 1
+        acquired = False
+        try:
+            async with self._generation_lock:
+                acquired = True
+                self._generation_waiters -= 1
+                yield
+        finally:
+            if not acquired and self._generation_waiters > 0:
+                self._generation_waiters -= 1
+
+    def _bind_generation_streams_once(self) -> None:
+        """Bind MLX generation streams on this worker, once per worker.
+
+        The snapshot is what makes the binding reversible. ``generation_stream``
+        is a module attribute, so pointing it at a worker's stream is a global
+        edit; if the worker later exits without it being put back, any other
+        thread that reads it gets a stream it cannot enter.
+        """
+        if self._pre_bind_generation_streams is None:
+            self._pre_bind_generation_streams = snapshot_generation_streams()
+        self._worker_generation_stream = _bind_worker_generation_streams(
+            self._worker_generation_stream
+        )
+        self._generation_streams_bound = True
 
     def prepare_for_start(self) -> None:
         """Load the backing model off the serving event loop."""
@@ -293,17 +724,20 @@ class SimpleEngine(BaseEngine):
         """Start the engine (load model if not loaded)."""
         if self._loaded:
             return
+        # A previous stop() latched this; clear it before anything asks
+        # _generation_worker_is_live, or the fresh worker looks dead on arrival.
+        self._stopping = False
         try:
             if self._model is None:
-                if self._uses_default_prepare_for_start():
-                    # MLX generation streams are thread-local. Keep model load on
-                    # the event-loop thread so default LLM stream_generate() runs
-                    # on the same thread that owns model-associated streams.
-                    self.prepare_for_start()
-                else:
-                    # Test doubles and custom overrides may block; preserve the
-                    # cancellation-safe threaded startup helper for those cases.
-                    await run_blocking_startup_work(self.prepare_for_start)
+                # MLX streams are thread-local and buffers built at load carry
+                # the stream they were built on, so load must happen on the very
+                # thread that later generates: the dedicated generation worker.
+                # This applies to an overridden prepare_for_start too — a
+                # subclass that loads on some other thread hits exactly the same
+                # failure, so there is no reason to split on which one it is.
+                await run_blocking_startup_work(
+                    self.prepare_for_start, executor=self._generation_worker()
+                )
             self._loaded = True
 
             if self._mtp and self._mtp_num_draft_tokens != 1:
@@ -314,49 +748,37 @@ class SimpleEngine(BaseEngine):
                 )
 
             # Probe whether this model's prompt cache is snapshot-safe for the
-            # stream_chat system-prefix cache branch. Sliding-window models
-            # (gemma3_text, olmo3, recurrent_gemma) return RotatingKVCache
-            # entries whose ``.state`` aliases in-place-mutated buffers.
-            # Only relevant for the LLM path; MLLM never enters the cache
-            # branch.
+            # stream_chat system-prefix cache branch. This is also refreshed
+            # below for MLLM text routing after the parallel TextModel exists.
             if not self._is_mllm and self._model is not None:
-                try:
-                    from mlx_lm.models.cache import KVCache, make_prompt_cache
-
-                    probe_cache = make_prompt_cache(self._model.model)
-                    self._supports_system_kv_cache = bool(probe_cache) and all(
-                        isinstance(c, KVCache) for c in probe_cache
-                    )
-                    if not self._supports_system_kv_cache:
-                        cache_types = sorted({type(c).__name__ for c in probe_cache})
-                        logger.info(
-                            "System KV cache snapshot disabled: model returned "
-                            "non-KVCache entries (%s); stream_chat will use the "
-                            "uncached path",
-                            cache_types,
-                        )
-                except Exception as e:
-                    logger.debug(
-                        "System KV cache support probe failed (%s); "
-                        "disabling snapshot path",
-                        e,
-                    )
-                    self._supports_system_kv_cache = False
+                backing_model = getattr(self._model, "model", self._model)
+                self._supports_system_kv_cache = self._probe_system_kv_cache_support(
+                    backing_model,
+                    "stream_chat",
+                )
 
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
             # on the slower mlx_vlm multimodal path.
             if self._is_mllm and self._should_route_text_through_text_model():
                 try:
-                    from ..text_model_from_vlm import build_text_model
 
-                    self._text_model = build_text_model(
-                        self._model.model, self._model_name
-                    )
+                    def build_text_route():
+                        from ..text_model_from_vlm import build_text_model
+
+                        text_model = build_text_model(
+                            self._model.model, self._model_name
+                        )
+                        if text_model is None:
+                            return None, None
+                        return text_model, self._model.get_tokenizer()
+
+                    (
+                        self._text_model,
+                        self._text_tokenizer,
+                    ) = await self._run_blocking_serialized(build_text_route)
 
                     if self._text_model is not None:
-                        self._text_tokenizer = self._model.get_tokenizer()
-
                         # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
                         if "qwen3" in self._model_name.lower():
                             self._text_tokenizer.eos_token = "<|im_end|>"
@@ -458,16 +880,49 @@ class SimpleEngine(BaseEngine):
             specprefill_info = (
                 ", SpecPrefill=active" if self._draft_model is not None else ""
             )
+            prefix_trie_info = (
+                ", prefix_trie_cache=True" if self._prefix_trie_cache_enabled else ""
+            )
             logger.info(
                 f"SimpleEngine loaded: {self._model_name} "
-                f"(MLLM={self._is_mllm}{mtp_info}{routing}{specprefill_info})"
+                f"(MLLM={self._is_mllm}{mtp_info}{routing}{specprefill_info}"
+                f"{prefix_trie_info})"
             )
         except asyncio.CancelledError:
             await cleanup_startup_cancellation(self.stop)
             raise
 
     async def stop(self) -> None:
-        """Stop the engine and cleanup resources."""
+        """Stop the engine and cleanup resources.
+
+        Must not block the event loop. The generation worker is handed whole
+        requests, and the server default is ``max_tokens=32768``, so waiting for
+        it here would freeze health checks, timers and cancellation for minutes.
+        Instead: signal, let in-flight routes wind down for a bounded moment,
+        then detach the worker and return.
+        """
+        self._stopping = True
+
+        executor = self._generation_executor
+        if executor is not None and self._generation_users > 0:
+            # Use the abort paths the long routes already implement, so the
+            # wait below usually resolves rather than times out.
+            for hook in list(self._generation_abort_hooks.values()):
+                try:
+                    hook()
+                except Exception:
+                    logger.debug("Generation abort hook failed", exc_info=True)
+            try:
+                await asyncio.wait_for(
+                    self._generation_idle.wait(), timeout=self.STOP_DRAIN_TIMEOUT_S
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning(
+                    "SimpleEngine.stop: generation worker still busy after %.1fs; "
+                    "detaching it to finish in the background",
+                    self.STOP_DRAIN_TIMEOUT_S,
+                )
+
         self._model = None
         self._text_model = None
         self._text_tokenizer = None
@@ -477,6 +932,41 @@ class SimpleEngine(BaseEngine):
         for k in self._system_kv_cache_stats:
             self._system_kv_cache_stats[k] = 0
         self._supports_system_kv_cache = False
+        with self._prefix_trie_cache_lock:
+            self._prefix_trie_cache = None
+        for k in self._prefix_trie_cache_stats:
+            self._prefix_trie_cache_stats[k] = 0
+
+        if executor is not None:
+            # Streams and any cache built on that thread die with it.
+            self._generation_executor = None
+            self._generation_streams_bound = False
+            # The stream belongs to the thread that made it, so it cannot
+            # outlive the worker: a fresh one must allocate its own.
+            self._worker_generation_stream = None
+            # The worker is going away, so the module-level generation streams
+            # must stop naming its stream — otherwise the next thread to read
+            # them gets "There is no Stream(gpu, N) in current thread".
+            pre_bind, self._pre_bind_generation_streams = (
+                self._pre_bind_generation_streams,
+                None,
+            )
+            if self._generation_users > 0:
+                # Something is still inside MLX. Detach the executor but leave
+                # it running: the route holding it still has a generator to
+                # close, and that has to happen on this thread. The last user
+                # retires it, and the next worker joins it before loading a
+                # model of its own.
+                self._draining_executors.append(executor)
+                if pre_bind is not None:
+                    # Queue the restore behind the work still on that thread.
+                    # max_workers=1 orders it last; restoring now would hand the
+                    # draining route a stream it cannot enter mid-close.
+                    executor.submit(restore_generation_streams, pre_bind)
+            else:
+                executor.shutdown(wait=False, cancel_futures=True)
+                if pre_bind is not None:
+                    restore_generation_streams(pre_bind)
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -485,36 +975,74 @@ class SimpleEngine(BaseEngine):
         """Return whether text-only MLLM requests may use mlx_lm TextModel."""
         return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
 
-    async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
+    async def _run_blocking_serialized(
+        self,
+        func,
+        /,
+        *args,
+        request_id: str | None = None,
+        on_cancel=None,
+        **kwargs,
+    ):
         """Run a blocking MLX operation under the generation lock.
 
         Cancellation must not release the async lock before the worker thread
         finishes, or a follow-up request can enter MLX/Metal concurrently and
         corrupt the command-buffer state.
         """
-        async with self._generation_lock:
+        request_id = request_id or f"simple-{id(func):x}"
+        async with self._acquire_generation_slot(request_id):
+            started_at = time.time()
+            self._active_requests[request_id] = {
+                "request_id": request_id,
+                "status": "running",
+                "kind": "blocking_serialized",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "elapsed_s": 0.0,
+                "started_at": started_at,
+            }
 
             def run_bound():
-                _bind_worker_generation_streams()
+                # One thread owns generation, so binding once is enough and
+                # rebinding per request would only churn streams.
+                self._bind_generation_streams_once()
                 return func(*args, **kwargs)
 
-            task = asyncio.create_task(asyncio.to_thread(run_bound))
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
+            worker = self._generation_worker()
+
+            async def _run_on_generation_worker():
+                return await self._submit_to_generation_worker(worker, run_bound)
+
+            # create_task over a coroutine, exactly as the asyncio.to_thread
+            # version did. Wrapping the executor future directly changes how
+            # cancellation and exception retrieval behave, which breaks
+            # SpecPrefill's cancel-during-scoring path.
+            async with self._generation_worker_in_use():
                 if on_cancel is not None:
-                    try:
-                        on_cancel()
-                    except Exception:
-                        logger.debug(
-                            "Blocking worker cancellation callback failed",
-                            exc_info=True,
-                        )
+                    # stop() drives these so a shutdown uses the same abort path
+                    # a client disconnect does.
+                    self._generation_abort_hooks[request_id] = on_cancel
+                task = asyncio.create_task(_run_on_generation_worker())
                 try:
-                    await task
-                except BaseException:
-                    pass
-                raise
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if on_cancel is not None:
+                        try:
+                            on_cancel()
+                        except Exception:
+                            logger.debug(
+                                "Blocking worker cancellation callback failed",
+                                exc_info=True,
+                            )
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                    raise
+                finally:
+                    self._generation_abort_hooks.pop(request_id, None)
+                    self._active_requests.pop(request_id, None)
 
     async def generate(
         self,
@@ -719,6 +1247,8 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
+        specprefill_backbone_pct_override = kwargs.pop("specprefill_backbone_pct", None)
+        request_id = str(kwargs.pop("request_id", "") or f"simple-{id(prompt):x}")
 
         # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
         if not self._is_mllm and self._draft_model is not None:
@@ -761,69 +1291,154 @@ class SimpleEngine(BaseEngine):
                         top_p,
                         stop=stop,
                         specprefill_keep_pct=specprefill_keep_pct_override,
+                        specprefill_backbone_pct=specprefill_backbone_pct_override,
                         **kwargs,
                     ):
                         yield output
                     return
 
-        async with self._generation_lock:
-            # Non-stream chat runs in a worker thread and rebinds generation
-            # streams there. Rebind again on the current thread before
-            # stream_generate so nonstream->stream mode switches remain valid.
-            _bind_worker_generation_streams()
+        async with self._acquire_generation_slot(request_id):
+            started_at = time.time()
+            self._active_requests[request_id] = {
+                "request_id": request_id,
+                "status": "running",
+                "kind": "stream_generate",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "elapsed_s": 0.0,
+                "started_at": started_at,
+            }
+            # Streaming has to run on the same thread as the non-stream route.
+            # Both share the prompt cache, and an MLX array can only be
+            # evaluated on the thread whose stream built its primitives, so
+            # pumping the generator here on the event loop thread meant every
+            # request after a non-stream turn died in generate_step with
+            # "There is no Stream(gpu, N) in current thread". Rebinding the
+            # module-level stream cannot bridge the two threads, because the
+            # cache already carries the stream it was built on.
+            worker = self._generation_worker()
+            iterator = None
+            aborted_by_stop = False
 
-            accumulated_text = ""
-            prompt_tokens = 0
-            completion_tokens = 0
-            finished = False
+            def _next_chunk():
+                self._bind_generation_streams_once()
+                try:
+                    return next(iterator)
+                except StopIteration:
+                    return _STREAM_DONE
 
-            for chunk in self._model.stream_generate(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                **kwargs,
-            ):
-                prompt_tokens = (
-                    chunk.prompt_tokens
-                    if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
-                    else prompt_tokens
-                )
-                completion_tokens += 1
-                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                accumulated_text += new_text
+            async with self._generation_worker_in_use():
+                try:
+                    accumulated_text = ""
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    finished = False
 
-                finished = (
-                    getattr(chunk, "finished", False) or completion_tokens >= max_tokens
-                )
-                finish_reason = None
-                if finished:
-                    finish_reason = getattr(chunk, "finish_reason", "stop")
+                    iterator = self._model.stream_generate(
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop,
+                        **kwargs,
+                    )
 
-                yield GenerationOutput(
-                    text=accumulated_text,
-                    new_text=new_text,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    finished=finished,
-                    finish_reason=finish_reason,
-                )
+                    while True:
+                        if not self._generation_worker_is_live(worker):
+                            # stop() ran. End the response here rather than
+                            # submitting to a dead executor, which would raise
+                            # in the middle of a client stream.
+                            aborted_by_stop = True
+                            break
+                        chunk = await self._submit_to_generation_worker(
+                            worker, _next_chunk
+                        )
+                        if chunk is _STREAM_DONE:
+                            break
+                        prompt_tokens = (
+                            chunk.prompt_tokens
+                            if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
+                            else prompt_tokens
+                        )
+                        completion_tokens += 1
+                        if request_id in self._active_requests:
+                            self._active_requests[request_id].update(
+                                {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "elapsed_s": round(time.time() - started_at, 1),
+                                }
+                            )
+                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                        accumulated_text += new_text
 
-                if finished:
-                    break
+                        finished = (
+                            getattr(chunk, "finished", False)
+                            or completion_tokens >= max_tokens
+                        )
+                        finish_reason = None
+                        if finished:
+                            finish_reason = getattr(chunk, "finish_reason", None)
+                            if finish_reason is None:
+                                finish_reason = (
+                                    "length"
+                                    if completion_tokens >= max_tokens
+                                    else "stop"
+                                )
 
-            if not finished:
-                if prompt_tokens == 0:
-                    prompt_tokens = len(self._model.tokenizer.encode(prompt))
-                yield GenerationOutput(
-                    text=accumulated_text,
-                    new_text="",
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    finished=True,
-                    finish_reason=None,
-                )
+                        yield GenerationOutput(
+                            text=accumulated_text,
+                            new_text=new_text,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                        )
+
+                        if finished:
+                            break
+
+                    if not finished:
+                        if prompt_tokens == 0 and self._model is not None:
+                            prompt_tokens = len(self._model.tokenizer.encode(prompt))
+                        if request_id in self._active_requests:
+                            self._active_requests[request_id].update(
+                                {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "elapsed_s": round(time.time() - started_at, 1),
+                                }
+                            )
+                        yield GenerationOutput(
+                            text=accumulated_text,
+                            new_text="",
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            finished=True,
+                            finish_reason="abort" if aborted_by_stop else "stop",
+                        )
+                finally:
+                    # Generator cleanup touches MLX, so it belongs on the worker
+                    # too — closing it here would evaluate on the loop thread.
+                    # during_shutdown lets it through while stop() is draining,
+                    # which is the whole point of that wait.
+                    if iterator is not None:
+                        try:
+                            await self._submit_to_generation_worker(
+                                worker, iterator.close, during_shutdown=True
+                            )
+                        except EngineStopped:
+                            # The worker is already gone, so no thread is left
+                            # that may evaluate these buffers; its teardown is
+                            # what releases them.
+                            logger.debug(
+                                "stream_generate close skipped: worker already down"
+                            )
+                        except Exception:
+                            logger.warning(
+                                "stream_generate close failed", exc_info=True
+                            )
+                    self._active_requests.pop(request_id, None)
 
     async def chat(
         self,
@@ -887,6 +1502,14 @@ class SimpleEngine(BaseEngine):
         # streaming implementation and aggregate its final state so both chat
         # APIs share the same tool-capable execution path.
         if tools and not self._is_mllm:
+            return await aggregate_stream_chat()
+
+        # Request-local logits processors (response_format / constrained JSON)
+        # need token-boundary progress and cancellation.  The blocking
+        # model.chat() call below only returns after the whole completion, so a
+        # slow constrained decode can look like a no-progress non-stream wedge
+        # and hold the serialized generation lock until max_tokens/timeout.
+        if kwargs.get("logits_processors") and not self._is_mllm:
             return await aggregate_stream_chat()
 
         # Text-only requests on MLLM models should always aggregate the
@@ -1008,6 +1631,7 @@ class SimpleEngine(BaseEngine):
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
+        has_media = has_media_content(messages)
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -1019,7 +1643,7 @@ class SimpleEngine(BaseEngine):
             and self._should_route_text_through_text_model(
                 mllm_draft_requested=mllm_draft_requested
             )
-            and not has_media_content(messages)
+            and not has_media
         ):
             has_mtp = (
                 hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
@@ -1049,51 +1673,111 @@ class SimpleEngine(BaseEngine):
         # Build prompt using tokenizer
         if self._is_mllm:
             if self._text_model is not None:
-                logger.info("Media request → MLLM path")
+                route_kind = "Media" if has_media else "Text-only"
+                logger.info("%s request → MLLM path", route_kind)
             # For MLLM, use stream_chat which yields tokens incrementally.
-            # Must hold _generation_lock to prevent concurrent Metal access
+            # Must hold the generation slot to prevent concurrent Metal access
             # (e.g. OpenCode sends title + main request simultaneously).
             accumulated_text = ""
             token_count = 0
+            request_id = str(kwargs.pop("request_id", "") or f"simple-{id(messages):x}")
+            native_video_request = bool(
+                getattr(self._model, "_video_native", False) is True
+                and self._model._collect_video_inputs(messages)
+            )
 
-            # Text-only fallback when no TextModel exists: keep execution on the
-            # current thread. Routing through to_thread can break mlx_vlm stream
-            # ownership on some models (Stream(gpu, N) mismatch).
-            if self._text_model is None and not has_media_content(messages):
+            if not native_video_request:
+                # Incremental mlx_vlm streams must stay on the model-owner
+                # thread. Moving them through to_thread can raise a
+                # Stream(gpu, N) ownership mismatch.
                 local_kwargs = mllm_call_kwargs()
 
-                async with self._generation_lock:
-                    _bind_worker_generation_streams()
-                    for chunk in self._model.stream_chat(
+                # Same thread rule as the text route: the MLLM model was loaded
+                # on the generation worker, so stream_chat has to be pumped
+                # there too. Running it on the event loop thread and rebinding
+                # the module-level stream cannot work, because the model
+                # buffers already carry the stream they were built on.
+                worker = self._generation_worker()
+                iterator = None
+
+                def _next_chat_chunk():
+                    self._bind_generation_streams_once()
+                    try:
+                        return next(iterator)
+                    except StopIteration:
+                        return _STREAM_DONE
+
+                async with (
+                    self._acquire_generation_slot(request_id),
+                    self._generation_worker_in_use(),
+                ):
+                    iterator = self._model.stream_chat(
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         tools=template_tools,
                         **local_kwargs,
-                    ):
-                        token_count += 1
-                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                        accumulated_text += new_text
+                    )
+                    try:
+                        while True:
+                            if not self._generation_worker_is_live(worker):
+                                # stop() ran; close the response out instead of
+                                # submitting to a dead executor mid-stream.
+                                yield GenerationOutput(
+                                    text=accumulated_text,
+                                    new_text="",
+                                    prompt_tokens=0,
+                                    completion_tokens=token_count,
+                                    finished=True,
+                                    finish_reason="abort",
+                                )
+                                break
+                            chunk = await self._submit_to_generation_worker(
+                                worker, _next_chat_chunk
+                            )
+                            if chunk is _STREAM_DONE:
+                                break
 
-                        finished = chunk.finish_reason is not None
+                            token_count += 1
+                            new_text = (
+                                chunk.text if hasattr(chunk, "text") else str(chunk)
+                            )
+                            accumulated_text += new_text
 
-                        yield GenerationOutput(
-                            text=accumulated_text,
-                            new_text=new_text,
-                            prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                            completion_tokens=token_count,
-                            finished=finished,
-                            finish_reason=chunk.finish_reason if finished else None,
-                            mtp_drafts=getattr(chunk, "mtp_drafts", 0),
-                            mtp_accepted=getattr(chunk, "mtp_accepted", 0),
-                        )
+                            finished = chunk.finish_reason is not None
 
-                        if finished:
-                            break
+                            yield GenerationOutput(
+                                text=accumulated_text,
+                                new_text=new_text,
+                                prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+                                completion_tokens=token_count,
+                                finished=finished,
+                                finish_reason=(
+                                    chunk.finish_reason if finished else None
+                                ),
+                                mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                                mtp_accepted=getattr(chunk, "mtp_accepted", 0),
+                            )
+
+                            if finished:
+                                break
+                    finally:
+                        try:
+                            await self._submit_to_generation_worker(
+                                worker, iterator.close, during_shutdown=True
+                            )
+                        except EngineStopped:
+                            logger.debug(
+                                "stream_chat close skipped: worker already down"
+                            )
+                        except Exception:
+                            logger.warning("stream_chat close failed", exc_info=True)
                 return
 
-            # Run stream_chat in thread pool since it's synchronous
-            def run_stream():
+            # mlx_vlm's native-video path is non-streaming and performs
+            # blocking preprocessing and generation. Keep it off the event
+            # loop while preserving serialized admission.
+            def run_native_video():
                 local_kwargs = mllm_call_kwargs()
                 return list(
                     self._model.stream_chat(
@@ -1105,15 +1789,15 @@ class SimpleEngine(BaseEngine):
                     )
                 )
 
-            chunks = await self._run_blocking_serialized(run_stream)
-
+            chunks = await self._run_blocking_serialized(
+                run_native_video,
+                request_id=request_id,
+            )
             for chunk in chunks:
                 token_count += 1
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
-
                 finished = chunk.finish_reason is not None
-
                 yield GenerationOutput(
                     text=accumulated_text,
                     new_text=new_text,
@@ -1124,9 +1808,6 @@ class SimpleEngine(BaseEngine):
                     mtp_drafts=getattr(chunk, "mtp_drafts", 0),
                     mtp_accepted=getattr(chunk, "mtp_accepted", 0),
                 )
-
-                if finished:
-                    break
             return
 
         # For LLM, apply chat template and stream
@@ -1147,14 +1828,41 @@ class SimpleEngine(BaseEngine):
                 template_kwargs["tools"] = template_tools
             safe_messages = normalize_messages_for_chat_template(messages)
 
-            try:
-                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
-            except TypeError:
-                # Some templates don't support all kwargs
-                for key in ["tools", "enable_thinking", *chat_template_kwargs.keys()]:
-                    if key in template_kwargs:
-                        del template_kwargs[key]
-                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+            if getattr(self, "use_harmony_rendering", False):
+                # GPT-OSS / harmony-format models: render via openai-harmony
+                # instead of the Jinja chat_template. Bypasses the
+                # ``extract_multimodal_content`` text-flattening upstream
+                # (which drops structural ``tool_calls`` for non-native
+                # parsers) and uses OpenAI's canonical renderer. See #568.
+                from ..utils.harmony_render import (
+                    render_messages as _harmony_render_messages,
+                )
+
+                _reasoning_effort = None
+                if chat_template_kwargs:
+                    _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
+                prompt = _harmony_render_messages(
+                    safe_messages,
+                    tools=template_tools,
+                    reasoning_effort=_reasoning_effort,
+                )
+            else:
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
+                except TypeError:
+                    # Some templates don't support all kwargs
+                    for key in [
+                        "tools",
+                        "enable_thinking",
+                        *chat_template_kwargs.keys(),
+                    ]:
+                        if key in template_kwargs:
+                            del template_kwargs[key]
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
@@ -1172,8 +1880,10 @@ class SimpleEngine(BaseEngine):
         system_tokens = None
         system_token_count = 0
         full_token_count = 0
+        full_tokens_list: list[int] | None = None
         system_hash = None
         kv_cache_eligible = False
+        prefix_trie_eligible = False
         # Snapshot reference captured at gate time so a concurrent MISS that
         # mutates ``self._system_kv_cache`` between the gate and the restore
         # (which runs later inside ``_run_blocking_serialized``) can't
@@ -1247,6 +1957,15 @@ class SimpleEngine(BaseEngine):
         # exposes any non-KVCache entries or the probe failed.
         if not self._supports_system_kv_cache:
             cache_blocking_controls.append("non_kv_cache_class")
+        # The system-prefix probe (re-renders the conversation with two different
+        # user contents and compares the rendered strings) goes through
+        # ``tokenizer.apply_chat_template``. When the harmony rendering path is
+        # active the actual prompt is built by ``openai-harmony`` instead, so the
+        # probe and the prompt would diverge and the cache would never hit.
+        # Falling back to the uncached path keeps correctness without splitting
+        # the probe across both renderers.
+        if getattr(self, "use_harmony_rendering", False):
+            cache_blocking_controls.append("harmony_rendering")
 
         if cache_blocking_controls:
             logger.info(
@@ -1274,6 +1993,18 @@ class SimpleEngine(BaseEngine):
 
         messages_for_cache = [_to_msg_dict(m) for m in messages]
         has_system = any(m.get("role") == "system" for m in messages_for_cache)
+
+        if (
+            self._prefix_trie_cache_enabled
+            and not cache_blocking_controls
+            and hasattr(tokenizer, "encode")
+        ):
+            bos_token = getattr(tokenizer, "bos_token", None)
+            add_special = bos_token is None or not prompt.startswith(bos_token)
+            full_tokens_list = tokenizer.encode(prompt, add_special_tokens=add_special)
+            full_token_count = len(full_tokens_list)
+            prefix_trie_eligible = bool(full_tokens_list)
+
         if (
             has_system
             and not cache_blocking_controls
@@ -1318,9 +2049,10 @@ class SimpleEngine(BaseEngine):
                     add_special = tokenizer.bos_token is None or not prompt.startswith(
                         tokenizer.bos_token
                     )
-                    full_tokens_list = tokenizer.encode(
-                        prompt, add_special_tokens=add_special
-                    )
+                    if full_tokens_list is None:
+                        full_tokens_list = tokenizer.encode(
+                            prompt, add_special_tokens=add_special
+                        )
                     system_tokens_list = tokenizer.encode(
                         system_prefix_text, add_special_tokens=add_special
                     )
@@ -1361,8 +2093,8 @@ class SimpleEngine(BaseEngine):
                                 system_hash,
                             )
 
-        if kv_cache_eligible:
-            # Cache-aware path: drive mlx-lm directly with a pre-populated cache.
+        if kv_cache_eligible or prefix_trie_eligible:
+            # Cache-aware path: drive mlx-lm directly with a prompt cache.
             # Stream chunks back to the caller via an asyncio.Queue (mirrors
             # _stream_generate_text) so the client sees tokens as they arrive
             # rather than after the full generation finishes.
@@ -1389,31 +2121,58 @@ class SimpleEngine(BaseEngine):
                 model = self._model.model
                 sampler = make_sampler(temp=temperature, top_p=top_p)
 
-                if cache_hit:
+                cache_key = list(full_tokens_list or [])
+                prefix_trie_hit = False
+                prefix_trie_rest_tokens: list[int] | None = None
+                local_hit_snapshot = hit_snapshot
+
+                # The model, prompt caches, and MLX streams belong to the pinned
+                # generation worker. LRUPromptCache.fetch_nearest_cache deep-copies
+                # cache arrays, so looking up on the event-loop thread would cross
+                # the same ownership boundary that worker pinning protects.
+                if prefix_trie_eligible and not cache_hit:
+                    trie_cache, trie_rest, trie_tokens_saved = (
+                        self._fetch_prefix_trie_cache(model, cache_key)
+                    )
+                    if trie_cache is not None and trie_rest is not None:
+                        prefix_trie_hit = True
+                        local_hit_snapshot = trie_cache
+                        prefix_trie_rest_tokens = trie_rest
+                        logger.info(
+                            "Prefix trie cache HIT (stream_chat): "
+                            "reusing %d tokens, prefilling %d new",
+                            trie_tokens_saved,
+                            len(trie_rest),
+                        )
+
+                if prefix_trie_hit:
+                    bc = local_hit_snapshot
+                elif cache_hit:
                     bc = make_prompt_cache(model)
                     # Restore from the closure-local reference captured at the
                     # gate, never from ``self._system_kv_cache`` directly:
                     # a concurrent MISS could have evicted the entry between
-                    # the gate check and this point.
-                    for i, saved_state in enumerate(hit_snapshot):
-                        bc[i].state = saved_state
+                    # the gate check and this point. Restore clones mutable
+                    # state containers so decode cannot mutate the saved LRU
+                    # snapshot by reference.
+                    self._restore_prompt_cache(bc, local_hit_snapshot)
                     # Bump LRU position. Safe to mutate here because the
                     # worker is serialized under ``_generation_lock``.
                     if system_hash in self._system_kv_cache:
                         self._system_kv_cache.move_to_end(system_hash)
                     self._system_kv_cache_stats["hits"] += 1
-                else:
+                elif kv_cache_eligible:
                     bc = make_prompt_cache(model)
                     sys_arr = mx.array(system_tokens)
                     step = self._prefill_step_size
                     while sys_arr.size > step:
                         model(sys_arr[:step][None], cache=bc)
-                        mx.eval([c.state for c in bc])
+                        self._eval_cache_snapshot([c.state for c in bc])
                         sys_arr = sys_arr[step:]
                         mx.clear_cache()
                     if sys_arr.size > 0:
                         model(sys_arr[None], cache=bc)
-                        mx.eval([c.state for c in bc])
+                        self._eval_cache_snapshot([c.state for c in bc])
 
                     # Free intermediate prefill activations before snapshotting.
                     # Intentionally stricter than the MLLM path, which does not
@@ -1422,8 +2181,8 @@ class SimpleEngine(BaseEngine):
                     # the KV state, not residual activations from prefill.
                     mx.clear_cache()
 
-                    snapshot = [c.state for c in bc]
-                    mx.eval([s for pair in snapshot for s in pair])
+                    snapshot = self._snapshot_prompt_cache(bc)
+                    self._eval_cache_snapshot(snapshot)
                     self._system_kv_cache[system_hash] = (snapshot, system_token_count)
                     self._system_kv_cache.move_to_end(system_hash)
                     evicted_count = 0
@@ -1453,8 +2212,15 @@ class SimpleEngine(BaseEngine):
                         system_token_count,
                         cache_mb,
                     )
+                else:
+                    bc = make_prompt_cache(model)
 
-                prompt_arr = mx.array(suffix_tokens)
+                prompt_tokens_for_decode = (
+                    prefix_trie_rest_tokens
+                    if prefix_trie_hit
+                    else suffix_tokens if kv_cache_eligible else cache_key
+                )
+                prompt_arr = mx.array(prompt_tokens_for_decode)
                 for resp in mlx_stream_generate(
                     model,
                     tokenizer,
@@ -1465,7 +2231,16 @@ class SimpleEngine(BaseEngine):
                 ):
                     if abort_event.is_set():
                         break
+                    token = getattr(resp, "token", None)
+                    if token is not None:
+                        try:
+                            cache_key.append(int(token))
+                        except TypeError:
+                            cache_key.append(int(token.item()))
                     _emit_response(resp)
+
+                if not abort_event.is_set() and bc is not None:
+                    self._insert_prefix_trie_cache(model, cache_key, bc)
 
             async def _produce_responses() -> None:
                 try:
@@ -1565,6 +2340,7 @@ class SimpleEngine(BaseEngine):
         top_p: float,
         stop: list[str] | None = None,
         specprefill_keep_pct: float | None = None,
+        specprefill_backbone_pct: float | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
@@ -1628,7 +2404,16 @@ class SimpleEngine(BaseEngine):
                 # Phase 2: Select important chunks
                 _cancel_check()
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                selected = select_chunks(importance, keep_pct=effective_keep)
+                effective_backbone = (
+                    specprefill_backbone_pct
+                    if specprefill_backbone_pct is not None
+                    else self._specprefill_backbone_pct
+                )
+                selected = select_chunks(
+                    importance,
+                    keep_pct=effective_keep,
+                    backbone_pct=effective_backbone,
+                )
                 n_selected = selected.shape[0]
 
                 # Phase 3: Sparse prefill on target model
@@ -1782,6 +2567,7 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
+        specprefill_backbone_pct = kwargs.pop("specprefill_backbone_pct", None)
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         top_k = kwargs.pop("top_k", 0)
         min_p = kwargs.pop("min_p", 0.0)
@@ -1846,18 +2632,21 @@ class SimpleEngine(BaseEngine):
         system_tokens = None
         suffix_tokens = None
         full_tokens_list = None
+        cache_blocking_controls = []
+        if not self._supports_system_kv_cache:
+            cache_blocking_controls.append("non_kv_cache_class")
+        if cache_blocking_controls:
+            logger.info(
+                "System KV cache SKIP (text route): request or engine has "
+                "controls/features the cache branch cannot honor (%s); using "
+                "uncached path",
+                cache_blocking_controls,
+            )
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
 
-        # Snapshot-safety: only enter the system-KV cache branch when start()'s
-        # probe verified the derived TextModel returns KVCache entries (and not
-        # RotatingKVCache, which aliases buffers mutated in place).
-        if (
-            has_system
-            and self._text_model is not None
-            and self._supports_system_kv_cache
-        ):
+        if has_system and self._text_model is not None and not cache_blocking_controls:
             # Find system prefix boundary in full prompt text.
             # ChatML format: system section ends where first non-system message begins.
             # Works with tools (rendered inside system section by Qwen templates).
@@ -1916,8 +2705,10 @@ class SimpleEngine(BaseEngine):
                             backbone_cache = make_prompt_cache(
                                 text_model, max_kv_size=_max_kv_size or None
                             )
-                            for i, saved_state in enumerate(system_kv_snapshot):
-                                backbone_cache[i].state = saved_state
+                            SimpleEngine._restore_prompt_cache(
+                                backbone_cache,
+                                system_kv_snapshot,
+                            )
 
                             prompt_to_send = mx.array(suffix_tokens)
                             return backbone_cache, prompt_to_send
@@ -2097,16 +2888,18 @@ class SimpleEngine(BaseEngine):
                 step = self._prefill_step_size
                 while sys_arr.size > step:
                     model(sys_arr[:step][None], cache=mc)
-                    mx.eval([c.state for c in mc])
+                    self._eval_cache_snapshot([c.state for c in mc])
                     sys_arr = sys_arr[step:]
                     mx.clear_cache()
                 if sys_arr.size > 0:
                     model(sys_arr[None], cache=mc)
-                    mx.eval([c.state for c in mc])
+                    self._eval_cache_snapshot([c.state for c in mc])
 
-                # Snapshot backbone cache (immutable mx.arrays, safe to reuse)
-                snapshot = [c.state for c in mc]
-                mx.eval([s for pair in snapshot for s in pair])
+                # Snapshot backbone cache. Cache arrays are treated as immutable;
+                # mutable state containers are copied so hybrid ArraysCache
+                # entries cannot alias the saved system-prefix state.
+                snapshot = self._snapshot_prompt_cache(mc)
+                self._eval_cache_snapshot(snapshot)
 
                 self._system_kv_cache[system_hash] = (snapshot, system_token_count)
                 self._system_kv_cache.move_to_end(system_hash)
@@ -2261,7 +3054,16 @@ class SimpleEngine(BaseEngine):
 
                 # Phase 2: Select important chunks
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                selected = select_chunks(importance, keep_pct=effective_keep)
+                effective_backbone = (
+                    specprefill_backbone_pct
+                    if specprefill_backbone_pct is not None
+                    else self._specprefill_backbone_pct
+                )
+                selected = select_chunks(
+                    importance,
+                    keep_pct=effective_keep,
+                    backbone_pct=effective_backbone,
+                )
                 n_selected = selected.shape[0]
                 n_total = len(specprefill_tokens)
 
@@ -2494,7 +3296,7 @@ class SimpleEngine(BaseEngine):
             "loaded": self._loaded,
             "running": self._loaded,
             "num_running": self._num_running,
-            "num_waiting": 0,
+            "num_waiting": self._generation_waiters,
             "num_requests_processed": self._total_requests_processed,
             "total_prompt_tokens": self._total_prompt_tokens,
             "total_completion_tokens": self._total_completion_tokens,
@@ -2503,6 +3305,11 @@ class SimpleEngine(BaseEngine):
                 "prompt_tps": 0.0,
             },
             "requests": requests_snapshot,
+            "generation_lock": {
+                "locked": self._generation_lock.locked(),
+                "admission": self._generation_lock_admission,
+                "busy_rejections": self._generation_busy_rejections,
+            },
         }
 
         # MLLM prefix cache stats, remapped to the shape BatchedEngine emits
@@ -2540,6 +3347,7 @@ class SimpleEngine(BaseEngine):
                 "draft_model": self._specprefill_draft_model_path,
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
+                "backbone_pct": self._specprefill_backbone_pct,
             }
 
         # System KV cache stats (LRU over multiple system prefixes)
@@ -2572,6 +3380,15 @@ class SimpleEngine(BaseEngine):
                 "total_memory_mb": round(total_bytes / 1e6, 1),
                 "slots": slots,
                 "counters": counters,
+            }
+
+        if self._prefix_trie_cache_enabled:
+            trie_entries, trie_bytes = self._prefix_trie_cache_snapshot()
+            stats["prefix_trie_cache"] = {
+                "enabled": True,
+                **self._prefix_trie_cache_stats,
+                "entries": trie_entries,
+                "memory_mb": round(trie_bytes / 1e6, 1),
             }
 
         # Include Metal memory stats
