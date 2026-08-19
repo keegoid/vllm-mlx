@@ -504,8 +504,8 @@ class SimpleEngine(BaseEngine):
             supported = bool(probe_cache) and all(
                 cls._cache_class_is_system_snapshot_safe(c) for c in probe_cache
             )
+            cache_types = sorted({type(c).__name__ for c in probe_cache})
             if not supported:
-                cache_types = sorted({type(c).__name__ for c in probe_cache})
                 logger.info(
                     "System KV cache snapshot disabled (%s): model returned "
                     "unsupported cache entries (%s); requests will use the "
@@ -513,12 +513,24 @@ class SimpleEngine(BaseEngine):
                     route,
                     cache_types,
                 )
+            else:
+                logger.info(
+                    "System KV cache snapshot enabled (%s): probed %s on %s",
+                    route,
+                    cache_types,
+                    type(model).__name__,
+                )
             return supported
         except Exception as e:
-            logger.debug(
-                "System KV cache support probe failed (%s, %s); "
+            # Was logger.debug: the probe silently disabling the cache is the
+            # single most confusing failure mode here, and the default server
+            # log level is INFO, so the reason was invisible in practice.
+            logger.warning(
+                "System KV cache support probe failed (%s) on %s: %s: %s; "
                 "disabling snapshot path",
                 route,
+                type(model).__name__,
+                type(e).__name__,
                 e,
             )
             return False
@@ -799,13 +811,20 @@ class SimpleEngine(BaseEngine):
                         # make_cache; probing with default args would mis-classify that
                         # path as snapshot-safe.
                         try:
-                            from mlx_lm.models.cache import KVCache, make_prompt_cache
+                            from mlx_lm.models.cache import make_prompt_cache
 
                             probe_cache = make_prompt_cache(
                                 self._text_model, max_kv_size=self._max_kv_size or None
                             )
+                            # Use the same snapshot-safety predicate as the
+                            # stream_chat probe. Hybrid models (e.g. qwen3_5*)
+                            # return a mix of ArraysCache (linear-attention
+                            # layers) and KVCache; ArraysCache is snapshot-safe,
+                            # so a KVCache-only test rejected them and silently
+                            # forced every text request onto the uncached path.
                             self._supports_system_kv_cache = bool(probe_cache) and all(
-                                isinstance(c, KVCache) for c in probe_cache
+                                self._cache_class_is_system_snapshot_safe(c)
+                                for c in probe_cache
                             )
                             if not self._supports_system_kv_cache:
                                 cache_types = sorted(
