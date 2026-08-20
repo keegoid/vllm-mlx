@@ -1182,6 +1182,69 @@ class TestSimpleEngineConcurrency:
             RotatingKVCache(max_size=128)
         )
 
+    def test_probe_accepts_hybrid_mixed_cache(self):
+        """The probe must accept a hybrid model's mixed cache.
+
+        ``qwen3_5.Model.make_cache()`` returns ``ArraysCache`` for
+        linear-attention layers and ``KVCache`` for the rest. Both classes are
+        snapshot-safe, so the probe must say True. A ``KVCache``-only test
+        (which the MLLM text route used to hardcode) rejected these models and
+        silently forced every text request onto the uncached path.
+        """
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class HybridModel:
+            def make_cache(self):
+                return [ArraysCache(size=2), KVCache(), ArraysCache(size=2)]
+
+        assert SimpleEngine._probe_system_kv_cache_support(
+            HybridModel(), "mllm_text_routing"
+        )
+
+    def test_probe_rejects_rotating_cache_under_bounded_kv(self):
+        """Bounded-KV serving must still be rejected on both routes.
+
+        With ``max_kv_size`` set, ``make_prompt_cache`` returns
+        ``RotatingKVCache`` for a model without a custom ``make_cache``. Its
+        ``.state`` aliases buffers that ``update_and_fetch`` mutates in place,
+        so snapshot capture would corrupt the cached prefix.
+        """
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class PlainModel:
+            layers = [object(), object()]
+
+        assert not SimpleEngine._probe_system_kv_cache_support(
+            PlainModel(), "mllm_text_routing", 2048
+        )
+        assert SimpleEngine._probe_system_kv_cache_support(
+            PlainModel(), "mllm_text_routing", None
+        )
+
+    def test_probe_failure_is_visible_and_disables_snapshot(self, caplog):
+        """A probe that raises must disable the cache *and* say so.
+
+        The server hardcodes ``basicConfig(level=logging.INFO)``, so a
+        debug-level message here disabled prefix caching with no visible
+        reason.
+        """
+        import logging
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class ExplodingModel:
+            def make_cache(self):
+                raise RuntimeError("probe boom")
+
+        with caplog.at_level(logging.WARNING, logger="vllm_mlx.engine.simple"):
+            assert not SimpleEngine._probe_system_kv_cache_support(
+                ExplodingModel(), "mllm_text_routing"
+            )
+        assert "probe boom" in caplog.text
+        assert "mllm_text_routing" in caplog.text
+
     @pytest.mark.anyio
     async def test_stream_chat_uses_gate_time_snapshot_under_concurrent_mutation(
         self,
