@@ -496,11 +496,20 @@ class SimpleEngine(BaseEngine):
             return cache_type in {"KVCache", "ArraysCache"}
 
     @classmethod
-    def _probe_system_kv_cache_support(cls, model: Any, route: str) -> bool:
+    def _probe_system_kv_cache_support(
+        cls, model: Any, route: str, max_kv_size: int | None = None
+    ) -> bool:
+        """Decide whether ``model``'s prompt cache is snapshot-safe.
+
+        ``max_kv_size`` must match the runtime constructor for the route being
+        probed. Under bounded-KV serving ``make_prompt_cache`` returns
+        ``RotatingKVCache`` for models without a custom ``make_cache``; probing
+        with default args would mis-classify that path as snapshot-safe.
+        """
         try:
             from mlx_lm.models.cache import make_prompt_cache
 
-            probe_cache = make_prompt_cache(model)
+            probe_cache = make_prompt_cache(model, max_kv_size=max_kv_size)
             supported = bool(probe_cache) and all(
                 cls._cache_class_is_system_snapshot_safe(c) for c in probe_cache
             )
@@ -804,46 +813,17 @@ class SimpleEngine(BaseEngine):
                         # when this flag is True, so sliding-window text models won't
                         # desynchronize on restore.
                         #
-                        # Probe args must match the runtime constructor in
-                        # _stream_generate_text (max_kv_size=self._max_kv_size or None).
-                        # Under bounded-KV serving (max_kv_size > 0) make_prompt_cache
-                        # returns RotatingKVCache for models without a custom
-                        # make_cache; probing with default args would mis-classify that
-                        # path as snapshot-safe.
-                        try:
-                            from mlx_lm.models.cache import make_prompt_cache
-
-                            probe_cache = make_prompt_cache(
-                                self._text_model, max_kv_size=self._max_kv_size or None
+                        # Shares one predicate with the pure-LLM probe so the two
+                        # routes cannot drift apart again: a KVCache-only test here
+                        # rejected hybrid models (ArraysCache + KVCache) and silently
+                        # forced every text request onto the uncached path.
+                        self._supports_system_kv_cache = (
+                            self._probe_system_kv_cache_support(
+                                self._text_model,
+                                "mllm_text_routing",
+                                self._max_kv_size or None,
                             )
-                            # Use the same snapshot-safety predicate as the
-                            # stream_chat probe. Hybrid models (e.g. qwen3_5*)
-                            # return a mix of ArraysCache (linear-attention
-                            # layers) and KVCache; ArraysCache is snapshot-safe,
-                            # so a KVCache-only test rejected them and silently
-                            # forced every text request onto the uncached path.
-                            self._supports_system_kv_cache = bool(probe_cache) and all(
-                                self._cache_class_is_system_snapshot_safe(c)
-                                for c in probe_cache
-                            )
-                            if not self._supports_system_kv_cache:
-                                cache_types = sorted(
-                                    {type(c).__name__ for c in probe_cache}
-                                )
-                                logger.info(
-                                    "System KV cache snapshot disabled for MLLM "
-                                    "text routing: TextModel returned non-KVCache "
-                                    "entries (%s); _stream_generate_text will use "
-                                    "the uncached path",
-                                    cache_types,
-                                )
-                        except Exception as e:
-                            logger.debug(
-                                "MLLM TextModel KV cache support probe failed "
-                                "(%s); disabling snapshot path",
-                                e,
-                            )
-                            self._supports_system_kv_cache = False
+                        )
 
                         has_mtp = (
                             hasattr(self._text_model, "mtp")
